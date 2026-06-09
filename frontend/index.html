@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Robot Navigator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0f0f0f;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 30px;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            margin-bottom: 6px;
+            color: #ffffff;
+            letter-spacing: 1px;
+        }
+
+        #subtitle {
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 24px;
+        }
+
+        #canvas-container {
+            position: relative;
+        }
+
+        canvas {
+            border: 2px solid #333;
+            border-radius: 4px;
+            cursor: crosshair;
+            display: block;
+        }
+
+        #info-bar {
+            margin-top: 16px;
+            display: flex;
+            gap: 24px;
+            font-size: 0.85rem;
+            color: #aaa;
+        }
+
+        #info-bar span {
+            background: #1a1a1a;
+            padding: 6px 14px;
+            border-radius: 4px;
+            border: 1px solid #2a2a2a;
+        }
+
+        #status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4caf50;
+            margin-right: 6px;
+        }
+
+        #status-dot.moving {
+            background: #ff9800;
+        }
+
+        #legend {
+            margin-top: 16px;
+            display: flex;
+            gap: 16px;
+            font-size: 0.8rem;
+            color: #888;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-box {
+            width: 14px;
+            height: 14px;
+            border-radius: 2px;
+            border: 1px solid #444;
+        }
+
+        #message {
+            margin-top: 12px;
+            font-size: 0.85rem;
+            color: #ff5252;
+            height: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Autonomous Robot Navigator</h1>
+    <p id="subtitle">Click on the grid to set a destination</p>
+
+    <div id="canvas-container">
+        <canvas id="grid" width="500" height="500"></canvas>
+    </div>
+
+    <div id="info-bar">
+        <span><span id="status-dot"></span><span id="status-text">Idle</span></span>
+        <span>Position: (<span id="pos-x">0</span>, <span id="pos-y">0</span>)</span>
+        <span>Goal: <span id="goal-text">None</span></span>
+    </div>
+
+    <div id="legend">
+        <div class="legend-item">
+            <div class="legend-box" style="background:#888"></div> Unknown
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#ffffff"></div> Free
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#111"></div> Obstacle
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#e53935"></div> Robot
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#fdd835"></div> Path
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#42a5f5"></div> Target
+        </div>
+    </div>
+
+    <div id="message"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

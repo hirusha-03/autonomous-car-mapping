@@ -12,8 +12,8 @@ grid = np.zeros(grid_size)
 grid[2:5, 5:7] = 1
 world_map = grid.copy()
 
-# Robot belief map
-robot_map = np.full(grid_size, 0.5)
+# Robot belief map — initialized to 0.0 (log-odds for 50% uncertainty)
+robot_map = np.full(grid_size, 0.0)
 
 # Robot state
 x, y = 0, 0
@@ -45,7 +45,8 @@ def on_click(event):
         print("Clicked outside grid")
         return
 
-    if robot_map[target_x, target_y] >= 0.8:
+    # Threshold now in log-odds space
+    if robot_map[target_x, target_y] >= 1.386:
         print("Target is an obstacle")
         return
 
@@ -69,7 +70,10 @@ def on_click(event):
 fig.canvas.mpl_connect('button_press_event', on_click)
 
 def draw(robot_x, robot_y):
-    display_map = robot_map.copy()
+    # Convert log-odds to probability for display
+    prob_map = ss.sigmoid(robot_map)
+
+    display_map = prob_map.copy()
     display_map[robot_x, robot_y] = 0.25
 
     for (px, py) in path:
@@ -87,7 +91,7 @@ def draw(robot_x, robot_y):
     ax.set_xticks(range(grid_size[0]))
     ax.set_yticks(range(grid_size[1]))
     ax.grid(True)
-    plt.pause(0.1)
+    plt.pause(0.1)    
 
 try:
     while True:

@@ -10,7 +10,7 @@ def a_star(start, goal, robot_map, grid_size):
         for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
             nx, ny = x + dx, y + dy
             if 0 <= nx < grid_size[0] and 0 <= ny < grid_size[1]:
-                if robot_map[nx, ny] < 0.8:  # not an obstacle
+                if robot_map[nx, ny] < 1.386:  # not an obstacle
                     neighbors.append((nx, ny))
         return neighbors
 
