@@ -13,6 +13,7 @@ class RobotState:
         self.robot_map = np.full(self.grid_size, 0.0)
         self.world_map = np.zeros(self.grid_size)
         self.world_map[2:5, 5:7] = 1
+        self.exploring = False
         self.lock = threading.Lock()
 
 robot = RobotState()    

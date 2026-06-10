@@ -116,6 +116,14 @@
         <span><span id="status-dot"></span><span id="status-text">Idle</span></span>
         <span>Position: (<span id="pos-x">0</span>, <span id="pos-y">0</span>)</span>
         <span>Goal: <span id="goal-text">None</span></span>
+        <button onclick="fetch(`${API}/explore/start`, {method:'POST'})
+            .then(()=> showMessage('Exploring...', '#4caf50'))">
+            Auto-explore
+        </button>
+        <button onclick="fetch(`${API}/explore/stop`, {method:'POST'})
+            .then(()=> showMessage('Stopped', '#aaa'))">
+            Stop
+        </button>
     </div>
 
     <div id="legend">

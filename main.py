@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from state import robot
 import sensorsweep as ss
 import astar as ast
+import frontier as fr
 from navigation import start as start_navigation
 
 app = FastAPI()
@@ -25,7 +26,7 @@ def startup():
     ss.sensor_sweep(robot.x, robot.y, robot.world_map, robot.robot_map, sensor_range=2)
     start_navigation()
 
-@app.get("/map")
+@app.get("/map")  # update existing /map to include exploring state
 def get_map():
     with robot.lock:
         return {
@@ -33,7 +34,11 @@ def get_map():
             "robot_map": robot.robot_map.tolist(),
             "world_map": robot.world_map.tolist(),
             "path": robot.path,
-            "is_moving": robot.is_moving
+            "is_moving": robot.is_moving,
+            "exploring": robot.exploring,         # add this
+            "frontiers": fr.find_frontiers(        # add this — renders in UI
+                robot.robot_map, robot.grid_size
+            )
         }
 
 @app.post("/navigate")
@@ -76,3 +81,23 @@ def get_status():
             "y": robot.y,
             "goal": robot.goal
         }
+
+@app.post("/explore/start")
+def start_explore():
+    with robot.lock:
+        if robot.is_moving:
+            return {"status": "error", "message": "Robot is moving"}
+        robot.exploring = True
+        robot.goal = None
+        robot.path = []
+        return {"status": "ok", "message": "Autonomous exploration started"}
+
+@app.post("/explore/stop")
+def stop_explore():
+    with robot.lock:
+        robot.exploring = False
+        robot.path = []
+        robot.goal = None
+        robot.is_moving = False
+        return {"status": "ok", "message": "Exploration stopped"}
+

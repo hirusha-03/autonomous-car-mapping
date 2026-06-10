@@ -33,6 +33,11 @@ function drawGrid(state) {
 
             } else if (pathSet.has(`${x},${y}`)) {
                 ctx.fillStyle = "#fdd835"; // path — yellow
+                
+            // In drawGrid, add this before the grayscale else block:
+            } else if (state.frontiers && state.frontiers.some(cluster =>
+                cluster.some(([fx, fy]) => fx === x && fy === y))) {
+                ctx.fillStyle = state.exploring ? "#ff9800" : "#fdd835"; // orange if exploring
 
             } else {
                 // Probability to grayscale
