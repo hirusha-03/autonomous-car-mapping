@@ -101,6 +101,18 @@
             color: #ff5252;
             height: 20px;
         }
+
+        #manual-controls {
+            margin-top: 16px;
+            display: flex;
+            gap: 10px;
+        }
+
+        #manual-hint {
+            margin-top: 6px;
+            font-size: 0.75rem;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -126,6 +138,14 @@
         </button>
     </div>
 
+    <div id="manual-controls">
+        <button onclick="manualMove('left')">&#8634; Left</button>
+        <button onclick="manualMove('forward')">&#8593; Forward</button>
+        <button onclick="manualMove('right')">&#8635; Right</button>
+        <button onclick="manualMove('stop')">Stop</button>
+    </div>
+    <p id="manual-hint">Manual control: use buttons or arrow keys (&larr; &uarr; &rarr;, space to stop)</p>
+
     <div id="legend">
         <div class="legend-item">
             <div class="legend-box" style="background:#888"></div> Unknown
@@ -137,7 +157,7 @@
             <div class="legend-box" style="background:#111"></div> Obstacle
         </div>
         <div class="legend-item">
-            <div class="legend-box" style="background:#e53935"></div> Robot
+            <div class="legend-box" style="background:#e53935"></div> Robot (white wedge = facing direction)
         </div>
         <div class="legend-item">
             <div class="legend-box" style="background:#fdd835"></div> Path
