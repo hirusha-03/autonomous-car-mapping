@@ -29,17 +29,24 @@ class Target(BaseModel):
 
 class SensorData(BaseModel):
     distance_cm: float
+    distance_left_cm: float | None = None
+    distance_right_cm: float | None = None
 
 
 class ManualMove(BaseModel):
     cmd: str  # "forward" | "left" | "right" | "stop"
 
 
+class SpeedSetting(BaseModel):
+    left_pct: int
+    right_pct: int
+
+
 # ── ESP32 endpoints ───────────────────────────────────────────────────────────
 
 @app.post("/sensor_data")
 def receive_sensor_data(data: SensorData):
-    """ESP32 pushes front HC-SR04 reading here every ~100 ms."""
+    """ESP32 pushes HC-SR04 readings here every ~100 ms (front required, left/right optional)."""
     with robot.lock:
         robot.sensor_distance_cm = data.distance_cm
         robot.sensor_updated = True
@@ -47,6 +54,18 @@ def receive_sensor_data(data: SensorData):
             robot.x, robot.y, robot.direction,
             data.distance_cm, robot.robot_map
         )
+        if data.distance_left_cm is not None:
+            robot.sensor_distance_left_cm = data.distance_left_cm
+            ss.update_from_real_sensor(
+                robot.x, robot.y, robot.direction,
+                data.distance_left_cm, robot.robot_map, side="left"
+            )
+        if data.distance_right_cm is not None:
+            robot.sensor_distance_right_cm = data.distance_right_cm
+            ss.update_from_real_sensor(
+                robot.x, robot.y, robot.direction,
+                data.distance_right_cm, robot.robot_map, side="right"
+            )
     return {"status": "ok"}
 
 
@@ -54,9 +73,25 @@ def receive_sensor_data(data: SensorData):
 def get_command():
     """ESP32 polls here to receive the next motor command (FIFO)."""
     with robot.lock:
-        if robot.command_queue:
-            return robot.command_queue.popleft()
-    return {"cmd": "none", "duration_ms": 0}
+        cmd = robot.command_queue.popleft() if robot.command_queue else {"cmd": "none", "duration_ms": 0}
+        cmd["left_pct"] = robot.motor_speed_left_pct
+        cmd["right_pct"] = robot.motor_speed_right_pct
+    return cmd
+
+
+@app.post("/speed")
+def set_speed(setting: SpeedSetting):
+    """Sets per-side motor PWM duty (%), applied by the ESP32 on its next
+    /command poll. Independent left/right (rather than one speed + a fixed
+    trim) because measured drift direction wasn't consistent across test
+    runs — see ai_context/INDEX.md. Clamped to 10-100: too low can't overcome
+    motor static friction and stalls without moving."""
+    left = max(10, min(100, setting.left_pct))
+    right = max(10, min(100, setting.right_pct))
+    with robot.lock:
+        robot.motor_speed_left_pct = left
+        robot.motor_speed_right_pct = right
+    return {"status": "ok", "left_pct": left, "right_pct": right}
 
 
 @app.get("/stop_flag")
@@ -67,6 +102,34 @@ def get_stop_flag():
         stop = robot.stop_requested
         robot.stop_requested = False
     return {"stop": stop}
+
+
+@app.post("/obstacle_stop")
+def obstacle_stop():
+    """ESP32 calls this when it self-aborted a forward drive because the front
+    sensor tripped the safety-stop distance mid-motion (see runMotion's live
+    obstacle check in robot_firmware.ino). The queued forward command did not
+    complete, so the robot's position did not actually advance — don't apply
+    pending_move. Mark the target cell as an obstacle so replanning avoids it."""
+    with robot.lock:
+        target = robot.pending_move
+        robot.pending_move = None
+        robot.command_queue.clear()
+        robot.is_moving = False
+        robot.path = []
+        robot.goal = None
+        if robot.mode in ("goto", "manual"):
+            robot.mode = "idle"
+        # explore mode is left as-is: the nav loop's idle-tick branch will
+        # pick a new frontier target on its own now that the map reflects
+        # the obstacle, so no extra handling is needed here.
+
+        if target is not None:
+            tx, ty = target
+            robot.robot_map[tx, ty] = max(
+                -ss.LOG_ODD_CLAMP, min(ss.LOG_ODD_CLAMP, robot.robot_map[tx, ty] + ss.LOG_ODD_HIT)
+            )
+    return {"status": "ok"}
 
 
 # ── Dashboard / frontend endpoints ───────────────────────────────────────────
@@ -92,8 +155,12 @@ def get_map():
             "exploring": robot.mode == "explore",  # kept for frontend compat
             "frontiers": fr.find_frontiers(robot.robot_map, robot.grid_size),
             "sensor_distance_cm": robot.sensor_distance_cm,
+            "sensor_distance_left_cm": robot.sensor_distance_left_cm,
+            "sensor_distance_right_cm": robot.sensor_distance_right_cm,
             "sensor_connected": robot.sensor_updated,
             "pending_commands": len(robot.command_queue),
+            "motor_speed_left_pct": robot.motor_speed_left_pct,
+            "motor_speed_right_pct": robot.motor_speed_right_pct,
         }
 
 
@@ -163,26 +230,33 @@ def stop_explore():
 def manual_move(move: ManualMove):
     """Device/user-driven control: joystick or arrow-key input from the dashboard."""
     with robot.lock:
-        if robot.is_moving:
-            return {"status": "error", "message": "Robot is already moving"}
-
+        # Stop must always go through, even mid-motion — it's the one command
+        # allowed to interrupt is_moving instead of being blocked by it.
         if move.cmd == "stop":
             robot.mode = "idle"
             robot.path = []
             robot.goal = None
             robot.pending_move = None
             robot.command_queue.clear()
+            robot.is_moving = False
             robot.stop_requested = True
             return {"status": "ok", "message": "Stopped"}
 
-        if move.cmd not in ("forward", "left", "right"):
+        if move.cmd not in ("forward", "reverse", "left", "right"):
             return {"status": "error", "message": f"Unknown command '{move.cmd}'"}
 
-        # Any in-progress goto/explore is superseded by manual control
+        # A new manual command interrupts whatever's currently running (goto,
+        # explore, or a previous manual move) instead of being rejected — lets
+        # the user chain arrow-key presses without an explicit stop in between.
+        if robot.is_moving:
+            robot.pending_move = None
+            robot.command_queue.clear()
+            robot.stop_requested = True
+
         robot.mode = "manual"
         robot.path = []
         robot.goal = None
-        robot.stop_requested = False
+        robot.is_moving = False
 
         if move.cmd == "left":
             robot.direction = (robot.direction + 1) % 4
@@ -196,8 +270,10 @@ def manual_move(move: ManualMove):
             robot.is_moving = True
             return {"status": "ok", "direction": DIRECTION_NAMES[robot.direction]}
 
-        # forward
+        # forward / reverse — reverse targets the cell behind the robot
         dx, dy = DIRECTION_VECTORS[robot.direction]
+        if move.cmd == "reverse":
+            dx, dy = -dx, -dy
         nx, ny = robot.x + dx, robot.y + dy
         if not (0 <= nx < robot.grid_size[0] and 0 <= ny < robot.grid_size[1]):
             robot.mode = "idle"
@@ -206,7 +282,10 @@ def manual_move(move: ManualMove):
             robot.mode = "idle"
             return {"status": "error", "message": "Blocked by obstacle"}
 
-        robot.command_queue.append({"cmd": "forward", "duration_ms": FORWARD_MS})
+        if move.cmd == "forward":
+            robot.command_queue.append({"cmd": "forward", "duration_ms": FORWARD_MS})
+        else:
+            robot.command_queue.append({"cmd": "reverse", "duration_ms": FORWARD_MS})
         robot.pending_move = (nx, ny)
         robot.is_moving = True
         return {"status": "ok", "moving_to": (nx, ny)}

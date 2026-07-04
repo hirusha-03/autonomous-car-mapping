@@ -113,6 +113,75 @@
             font-size: 0.75rem;
             color: #666;
         }
+
+        #speed-control {
+            margin-top: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 320px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 14px 18px;
+        }
+
+        .speed-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .speed-row label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            color: #aaa;
+            width: 60px;
+            flex-shrink: 0;
+        }
+
+        .speed-badge {
+            font-variant-numeric: tabular-nums;
+            font-size: 0.75rem;
+            color: #4caf50;
+            background: #4caf5018;
+            padding: 1px 6px;
+            border-radius: 10px;
+        }
+
+        .speed-row input[type="range"] {
+            flex: 1;
+            -webkit-appearance: none;
+            appearance: none;
+            height: 4px;
+            border-radius: 2px;
+            background: #333;
+            outline: none;
+        }
+
+        .speed-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #4caf50;
+            cursor: pointer;
+            border: 2px solid #0f0f0f;
+            box-shadow: 0 0 0 1px #4caf50;
+        }
+
+        .speed-row input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #4caf50;
+            cursor: pointer;
+            border: 2px solid #0f0f0f;
+            box-shadow: 0 0 0 1px #4caf50;
+        }
     </style>
 </head>
 <body>
@@ -128,6 +197,7 @@
         <span><span id="status-dot"></span><span id="status-text">Idle</span></span>
         <span>Position: (<span id="pos-x">0</span>, <span id="pos-y">0</span>)</span>
         <span>Goal: <span id="goal-text">None</span></span>
+        <span>Sonar F/L/R: <span id="sonar-f">-</span>/<span id="sonar-l">-</span>/<span id="sonar-r">-</span> cm</span>
         <button onclick="fetch(`${API}/explore/start`, {method:'POST'})
             .then(()=> showMessage('Exploring...', '#4caf50'))">
             Auto-explore
@@ -142,9 +212,21 @@
         <button onclick="manualMove('left')">&#8634; Left</button>
         <button onclick="manualMove('forward')">&#8593; Forward</button>
         <button onclick="manualMove('right')">&#8635; Right</button>
+        <button onclick="manualMove('reverse')">&#8595; Reverse</button>
         <button onclick="manualMove('stop')">Stop</button>
     </div>
-    <p id="manual-hint">Manual control: use buttons or arrow keys (&larr; &uarr; &rarr;, space to stop)</p>
+    <p id="manual-hint">Manual control: use buttons or arrow keys (&larr; &uarr; &darr; &rarr;, space to stop)</p>
+
+    <div id="speed-control">
+        <div class="speed-row">
+            <label for="speed-left">Left <span class="speed-badge" id="speed-left-value">70%</span></label>
+            <input type="range" id="speed-left" min="10" max="100" value="70">
+        </div>
+        <div class="speed-row">
+            <label for="speed-right">Right <span class="speed-badge" id="speed-right-value">70%</span></label>
+            <input type="range" id="speed-right" min="10" max="100" value="70">
+        </div>
+    </div>
 
     <div id="legend">
         <div class="legend-item">
@@ -164,6 +246,15 @@
         </div>
         <div class="legend-item">
             <div class="legend-box" style="background:#42a5f5"></div> Target
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#00e5ff"></div> Sonar (front)
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#76ff03"></div> Sonar (left)
+        </div>
+        <div class="legend-item">
+            <div class="legend-box" style="background:#ff4081"></div> Sonar (right)
         </div>
     </div>
 

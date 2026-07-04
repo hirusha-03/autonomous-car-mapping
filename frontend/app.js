@@ -12,6 +12,25 @@ const DIR_SCREEN_VECTOR = {
     West:  [-1, 0],
     South: [0, 1],
 };
+const DIR_ORDER = ["East", "North", "West", "South"]; // must match backend DIRECTION_NAMES order
+
+// Must match sensorsweep.py's CELL_SIZE_CM — converts a sensor's raw cm
+// reading into grid-cell units so the ray can be drawn at the right length.
+const CELL_SIZE_CM = 30;
+
+const SENSOR_RAY_COLOR = { front: "#00e5ff", left: "#76ff03", right: "#ff4081" };
+
+// Direction a sensor ray points in screen space. Front is straight ahead;
+// left/right mirror sensorsweep.py's _diagonal_vector (forward + perpendicular)
+// approximating the ~30deg-angled side sensors on a 4-directional grid.
+function sensorRayVector(directionName, side) {
+    const [dx, dy] = DIR_SCREEN_VECTOR[directionName];
+    if (!side) return [dx, dy];
+    const idx = DIR_ORDER.indexOf(directionName);
+    const perpIdx = side === "left" ? (idx + 1) % 4 : (idx + 3) % 4;
+    const [pdx, pdy] = DIR_SCREEN_VECTOR[DIR_ORDER[perpIdx]];
+    return [dx + pdx, dy + pdy];
+}
 
 let currentTarget = null;
 let lastState = null;
@@ -117,9 +136,52 @@ function drawDirectionWedge(px, py, direction) {
     ctx.fill();
 }
 
+// Draws each sensor's current reading as a ray from the robot's cell, so the
+// live sonar view can be compared directly against the accumulated robot_map
+// underneath it. Dashed while sensor_connected is false (no real reading has
+// arrived yet — the value shown is just the un-updated default).
+function drawSensorRays(state) {
+    const { robot_position, robot_direction, sensor_connected } = state;
+    const [rx, ry] = robot_position;
+    const cx = (rx + 0.5) * CELL_SIZE;
+    const cy = (GRID_SIZE - 1 - ry + 0.5) * CELL_SIZE;
+
+    const rays = [
+        { side: null,    dist: state.sensor_distance_cm,       color: SENSOR_RAY_COLOR.front },
+        { side: "left",  dist: state.sensor_distance_left_cm,  color: SENSOR_RAY_COLOR.left },
+        { side: "right", dist: state.sensor_distance_right_cm, color: SENSOR_RAY_COLOR.right },
+    ];
+
+    ctx.lineWidth = 2;
+    ctx.setLineDash(sensor_connected ? [] : [4, 4]);
+
+    for (const ray of rays) {
+        if (ray.dist == null) continue;
+        const [dx, dy] = sensorRayVector(robot_direction, ray.side);
+        const mag = Math.hypot(dx, dy) || 1;
+        const lengthPx = (ray.dist / CELL_SIZE_CM) * CELL_SIZE;
+        const ex = cx + (dx / mag) * lengthPx;
+        const ey = cy + (dy / mag) * lengthPx;
+
+        ctx.strokeStyle = ray.color;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+
+        ctx.fillStyle = ray.color;
+        ctx.beginPath();
+        ctx.arc(ex, ey, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    ctx.setLineDash([]);
+}
+
 function drawGrid(state) {
     drawBaseLayer(state.robot_map);
     drawOverlays(state);
+    drawSensorRays(state);
 }
 
 // ─── Sigmoid ─────────────────────────────────────────────────
@@ -137,6 +199,10 @@ function updateStatus(state) {
 
     posX.textContent = state.robot_position[0];
     posY.textContent = state.robot_position[1];
+
+    document.getElementById("sonar-f").textContent = state.sensor_distance_cm.toFixed(0);
+    document.getElementById("sonar-l").textContent = state.sensor_distance_left_cm.toFixed(0);
+    document.getElementById("sonar-r").textContent = state.sensor_distance_right_cm.toFixed(0);
 
     if (state.is_moving) {
         dot.className = "moving";
@@ -218,11 +284,12 @@ canvas.addEventListener("click", async (e) => {
 });
 
 // ─── Manual Control ────────────────────────────────────────────
+// No client-side is_moving guard here: /manual/move is designed to
+// interrupt whatever's currently running (goto, explore, or a previous
+// manual move) instead of rejecting — a guard based on `lastState` (which
+// only refreshes every 300ms) would block legitimate follow-up commands
+// (e.g. stop then left) while the poll is still stale.
 async function manualMove(cmd) {
-    if (cmd !== "stop" && lastState && lastState.is_moving) {
-        showMessage("Robot is moving, please wait");
-        return;
-    }
     try {
         const res = await fetch(`${API}/manual/move`, {
             method: "POST",
@@ -241,8 +308,52 @@ async function manualMove(cmd) {
     }
 }
 
+// ─── Speed Control ───────────────────────────────────────────────
+// Independent left/right sliders rather than one speed + a fixed trim:
+// measured drift direction wasn't consistent across test runs, so a single
+// fixed-direction correction would assume a bias that doesn't always hold —
+// letting the user dial in whichever side needs it that session instead.
+const speedLeftSlider = document.getElementById("speed-left");
+const speedRightSlider = document.getElementById("speed-right");
+const speedLeftValue = document.getElementById("speed-left-value");
+const speedRightValue = document.getElementById("speed-right-value");
+
+async function postSpeed() {
+    // Physical left/right are wired backwards from what the server's
+    // left_pct/right_pct (ENA/ENB) assume — crossed here rather than in
+    // firmware/server so the on-screen "Left"/"Right" labels stay true to
+    // the actual chassis side; the API fields are just swapped in transit.
+    const left_pct = parseInt(speedRightSlider.value, 10);
+    const right_pct = parseInt(speedLeftSlider.value, 10);
+    try {
+        const res = await fetch(`${API}/speed`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ left_pct, right_pct })
+        });
+        const data = await res.json();
+        speedRightSlider.value = data.left_pct;   // reflect server-side clamping (crossed back)
+        speedLeftSlider.value = data.right_pct;
+        speedRightValue.textContent = `${data.left_pct}%`;
+        speedLeftValue.textContent = `${data.right_pct}%`;
+        showMessage(`Speed set: L${data.right_pct}% / R${data.left_pct}%`, "#4caf50");
+    } catch (err) {
+        showMessage("Speed update failed");
+    }
+}
+
+speedLeftSlider.addEventListener("change", postSpeed);
+speedRightSlider.addEventListener("change", postSpeed);
+
+speedLeftSlider.addEventListener("input", () => {
+    speedLeftValue.textContent = `${speedLeftSlider.value}%`; // live label while dragging
+});
+speedRightSlider.addEventListener("input", () => {
+    speedRightValue.textContent = `${speedRightSlider.value}%`;
+});
+
 document.addEventListener("keydown", (e) => {
-    const keyMap = { ArrowUp: "forward", ArrowLeft: "left", ArrowRight: "right", " ": "stop" };
+    const keyMap = { ArrowUp: "forward", ArrowDown: "reverse", ArrowLeft: "left", ArrowRight: "right", " ": "stop" };
     const cmd = keyMap[e.key];
     if (!cmd) return;
     e.preventDefault();

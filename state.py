@@ -12,8 +12,8 @@ DIRECTION_NAMES   = ["East", "North", "West", "South"]
 class RobotState:
     def __init__(self):
         self.grid_size = (50, 50)
-        self.x = 0
-        self.y = 0
+        self.x = self.grid_size[0] // 2
+        self.y = self.grid_size[1] // 2
         self.direction = 0          # starts facing East
         self.path = []
         self.is_moving = False
@@ -25,8 +25,11 @@ class RobotState:
         self.mode = "idle"
         self.lock = threading.Lock()
 
-        # Real sensor data from ESP32
-        self.sensor_distance_cm = 400.0  # last front-sensor reading
+        # Real sensor data from ESP32 — front is required, left/right are
+        # optional angled (~30deg) side sensors, default to "clear" until seen.
+        self.sensor_distance_cm = 400.0       # last front-sensor reading
+        self.sensor_distance_left_cm = 400.0
+        self.sensor_distance_right_cm = 400.0
         self.sensor_updated = False       # True once first real reading arrives
 
         # Motor command queue — navigation fills it, ESP32 drains it
@@ -42,6 +45,17 @@ class RobotState:
         # can interrupt a drive/turn already in progress instead of waiting
         # for the current command's full duration_ms to elapse.
         self.stop_requested = False
+
+        # Independent motor PWM duty per side (10-100), applied by the ESP32
+        # to ENA (left)/ENB (right). Separate rather than one speed + trim
+        # because measured drift direction wasn't consistent across test
+        # runs (see ai_context/INDEX.md Hardware Calibration Log) — a fixed
+        # one-directional trim would assume a bias that doesn't always hold.
+        # Attached fresh to every /command response rather than threaded
+        # through each enqueue call site, so a change takes effect on the
+        # very next command the robot executes.
+        self.motor_speed_left_pct = 70
+        self.motor_speed_right_pct = 70
 
 
 robot = RobotState()

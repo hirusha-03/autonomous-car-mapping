@@ -1,8 +1,14 @@
 /*
   Autonomous Exploration Robot — ESP32 Firmware
   Hardware:
-    HC-SR04 (physically mounted at rear): TRIG=GPIO18, ECHO=GPIO19
+    HC-SR04 front (physically mounted at rear of chassis): TRIG=GPIO18, ECHO=GPIO19
+    HC-SR04 left  (~30deg off front): TRIG=GPIO4,  ECHO=GPIO5
+    HC-SR04 right (~30deg off front): TRIG=GPIO15, ECHO=GPIO13
     L298N: IN1=GPIO25, IN2=GPIO26, IN3=GPIO27, IN4=GPIO14
+    NOTE: ENA/ENB are jumper-capped (always full speed, no PWM control).
+    KNOWN ISSUE (unresolved, flagged for later): robot drifts left on
+    driveForward — left wheel spins slower than right. Needs ENA/ENB wired
+    to ESP32 PWM pins + per-side speed trim to fix; deferred for now.
 */
 
 #include <WiFi.h>
@@ -10,83 +16,148 @@
 #include <ArduinoJson.h>
 
 // ── CONFIG ───────────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "Sagarika's A07";
-const char* WIFI_PASSWORD = "qqqqqqqq";
-const char* SERVER_URL    = "http://192.168.56.1:8000";
+const char* WIFI_SSID     = "Hirusha’s iPhone";
+const char* WIFI_PASSWORD = "HnH@141414";
+const char* SERVER_URL    = "http://172.20.10.2:8000";
 
 // Calibration — tune these on the real robot
-const int TURN_90_MS  = 650;
+// TURN_90_MS was measured doing a full 360 instead of 90 at the old value
+// (650ms) — hardware-tested result: 650ms ≈ 360°, so 90° ≈ 650/4.
+const int TURN_90_MS  = 163;
 const int FORWARD_MS  = 800;
-const int MOTOR_SPEED = 200;
 
-// Manual-stop responsiveness: motion delay() is split into chunks this long,
-// polling /stop_flag between each so a manual stop can abort a drive/turn
-// already in progress instead of waiting out the full duration_ms.
+// Motion delay() is split into chunks this long, polling /stop_flag (and,
+// during driveForward, the front sensor) between each chunk — so a manual
+// stop or an obstacle can abort a drive/turn already in progress instead of
+// waiting out the full duration_ms blind.
 const int STOP_POLL_CHUNK_MS = 150;
+
+// Forward drive self-aborts if the front sensor reads closer than this
+// mid-motion. Independent of the server's occupancy-grid obstacle ratio
+// (sensorsweep.py) — this is purely a physical collision-avoidance cutoff,
+// intentionally tighter than one grid cell (30cm) so it trips before contact.
+const float SAFETY_STOP_CM = 15.0;
 
 // ── PIN DEFINITIONS ──────────────────────────────────────────────────────────
 #define TRIG_PIN 18
 #define ECHO_PIN 19
+#define TRIG_PIN_L 4
+#define ECHO_PIN_L 5
+#define TRIG_PIN_R 15
+#define ECHO_PIN_R 13
 #define IN1 25
 #define IN2 26
 #define IN3 27
 #define IN4 14
+#define ENA_PIN 32   // PWM speed for motor A / left side (IN1/IN2) — jumper removed
+#define ENB_PIN 33   // PWM speed for motor B / right side (IN3/IN4) — jumper removed
+// If left/right feel swapped on the real chassis, swap ENA_PIN/ENB_PIN here
+// rather than relabeling anything server-side.
+
+// Requires ESP32 Arduino core >=3.0 (analogWrite is PWM-backed there; on
+// older cores use ledcAttach/ledcWrite instead).
+// Independent per-side rather than one speed + a fixed trim: measured drift
+// direction wasn't consistent across test runs (see ai_context/INDEX.md
+// Hardware Calibration Log), so a single fixed-direction correction would
+// assume a bias that doesn't always hold — these are user-adjustable instead.
+int motorSpeedLeftPct = 70;
+int motorSpeedRightPct = 70;
 
 // ── SENSOR ───────────────────────────────────────────────────────────────────
-float readDistance() {
-  digitalWrite(TRIG_PIN, LOW);
+// Fired one at a time (not simultaneously) — HC-SR04s cross-talk if triggered
+// together, each echo can pick up another sensor's ultrasonic pulse.
+float readDistanceOn(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(trigPin, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  long duration = pulseIn(echoPin, HIGH, 25000);
   if (duration == 0) return 400.0;
   return duration * 0.0343f / 2.0f;
 }
 
+float readDistance() {
+  return readDistanceOn(TRIG_PIN, ECHO_PIN);
+}
+
 // ── MOTORS ───────────────────────────────────────────────────────────────────
+void applySpeed() {
+  analogWrite(ENA_PIN, motorSpeedLeftPct * 255 / 100);
+  analogWrite(ENB_PIN, motorSpeedRightPct * 255 / 100);
+}
+
 void stopMotors() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA_PIN, 0);
+  analogWrite(ENB_PIN, 0);
 }
 
-// Runs the motion for `ms`, but checks /stop_flag every STOP_POLL_CHUNK_MS
-// so a manual stop can cut it short instead of blocking for the full duration.
-void runMotion(int ms) {
+void setMotorPins(int in1, int in2, int in3, int in4) {
+  digitalWrite(IN1, in1); digitalWrite(IN2, in2);
+  digitalWrite(IN3, in3); digitalWrite(IN4, in4);
+  applySpeed();
+}
+
+// Runs the motion for `ms` in STOP_POLL_CHUNK_MS steps, checking /stop_flag
+// between each so a manual stop can cut it short. If checkObstacle is true
+// (forward drive only), also checks the front sensor between chunks and
+// self-aborts before contact — this is what closes the "blind for 800ms per
+// cell" gap: previously the sensor was only read once, before the drive
+// started, so anything that appeared mid-drive went undetected until impact.
+// obstacleHit (if non-null) reports whether the obstacle check tripped.
+bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) {
+  bool hit = false;
   int remaining = ms;
+
   while (remaining > 0) {
     int chunk = remaining < STOP_POLL_CHUNK_MS ? remaining : STOP_POLL_CHUNK_MS;
     delay(chunk);
     remaining -= chunk;
-    if (remaining > 0 && checkStopRequested()) {
+    if (remaining <= 0) break;
+
+    if (checkObstacle && readDistance() < SAFETY_STOP_CM) {
+      Serial.println("[SAFETY] Obstacle within stop distance — aborting motion early");
+      hit = true;
+      break;
+    }
+    if (checkStopRequestedForward()) {
       Serial.println("[STOP] Manual stop — aborting motion early");
       break;
     }
   }
+
   stopMotors();
+  if (obstacleHit) *obstacleHit = hit;
+  return !hit;
 }
 
-void driveForward(int ms) {
+void driveForward(int ms, bool& obstacleHit) {
   // Motor polarity swapped: sensorsweep.py assumes the HC-SR04 faces the
   // direction of travel (it marks cells ahead of robot.direction as sensed).
   // The old pin pattern drove the robot away from the sensor end, so the
   // sensor was actually reading behind the robot. Swapping polarity here
   // makes "forward" drive toward the sensor end, matching that assumption.
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setMotorPins(LOW, HIGH, LOW, HIGH);
+  runMotion(ms, /*checkObstacle=*/true, &obstacleHit);
+}
+
+void driveReverse(int ms) {
+  // Opposite polarity of driveForward — drives away from the sensor end.
+  // No rear sensor, so no live obstacle check here.
+  setMotorPins(HIGH, LOW, HIGH, LOW);
   runMotion(ms);
 }
 
 void turnLeft(int ms) {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  setMotorPins(LOW, HIGH, HIGH, LOW);
   runMotion(ms);
 }
 
 void turnRight(int ms) {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setMotorPins(HIGH, LOW, LOW, HIGH);
   runMotion(ms);
 }
 
@@ -126,59 +197,68 @@ void ensureWifi() {
   while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(100);
 }
 
-void postSensorData(float distance) {
+// Shared HTTP helper — all endpoint calls (sensor push, command poll, stop
+// poll, obstacle report) are a GET or POST to SERVER_URL+path with a JSON
+// body, differing only in timeout and what they do with the response.
+// Returns the HTTP status code, or -1 if WiFi wasn't connected; on success
+// the response body is written to `response`.
+int httpRequest(const String& path, bool isPost, const String& body, int timeoutMs, String& response) {
   ensureWifi();
-  if (WiFi.status() != WL_CONNECTED) { Serial.println("[SENSOR] WiFi not connected, skipping"); return; }
+  if (WiFi.status() != WL_CONNECTED) return -1;
 
   HTTPClient http;
-  http.begin(String(SERVER_URL) + "/sensor_data");
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1000);
+  http.begin(String(SERVER_URL) + path);
+  http.setTimeout(timeoutMs);
 
-  String body = "{\"distance_cm\":" + String(distance, 1) + "}";
-  int code = http.POST(body);
-  if (code != 200) Serial.printf("[SENSOR] POST failed, HTTP %d\n", code);
-  else Serial.printf("[SENSOR] %.1f cm → OK\n", distance);
+  int code;
+  if (isPost) {
+    http.addHeader("Content-Type", "application/json");
+    code = http.POST(body);
+  } else {
+    code = http.GET();
+  }
+  if (code == 200) response = http.getString();
   http.end();
+  return code;
 }
 
-bool checkStopRequested() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+void postSensorData(float distFront, float distLeft, float distRight) {
+  String body = "{\"distance_cm\":" + String(distFront, 1) +
+                ",\"distance_left_cm\":" + String(distLeft, 1) +
+                ",\"distance_right_cm\":" + String(distRight, 1) + "}";
+  String response;
+  int code = httpRequest("/sensor_data", true, body, 1000, response);
+  if (code != 200) Serial.printf("[SENSOR] POST failed, HTTP %d\n", code);
+  else Serial.printf("[SENSOR] F=%.1f L=%.1f R=%.1f cm -> OK\n", distFront, distLeft, distRight);
+}
 
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + "/stop_flag");
-  http.setTimeout(300);  // short — this runs between motion chunks, must stay snappy
+void reportObstacleStop() {
+  String response;
+  int code = httpRequest("/obstacle_stop", true, "{}", 500, response);
+  if (code != 200) Serial.printf("[SAFETY] /obstacle_stop report failed, HTTP %d\n", code);
+}
 
-  int code = http.GET();
-  if (code != 200) { http.end(); return false; }
-
-  String payload = http.getString();
-  http.end();
+bool checkStopRequestedForward() {
+  String response;
+  int code = httpRequest("/stop_flag", false, "", 300, response);  // short timeout — runs between motion chunks
+  if (code != 200) return false;
 
   StaticJsonDocument<64> doc;
-  if (deserializeJson(doc, payload) != DeserializationError::Ok) return false;
-
+  if (deserializeJson(doc, response) != DeserializationError::Ok) return false;
   return doc["stop"] | false;
 }
 
 String fetchCommand(int& out_duration) {
-  ensureWifi();
-  if (WiFi.status() != WL_CONNECTED) return "none";
-
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + "/command");
-  http.setTimeout(1000);
-
-  int code = http.GET();
-  if (code != 200) { Serial.printf("[CMD] GET failed, HTTP %d\n", code); http.end(); return "none"; }
-
-  String payload = http.getString();
-  http.end();
+  String response;
+  int code = httpRequest("/command", false, "", 1000, response);
+  if (code != 200) { Serial.printf("[CMD] GET failed, HTTP %d\n", code); return "none"; }
 
   StaticJsonDocument<128> doc;
-  if (deserializeJson(doc, payload) != DeserializationError::Ok) return "none";
+  if (deserializeJson(doc, response) != DeserializationError::Ok) return "none";
 
   out_duration = doc["duration_ms"] | 500;
+  motorSpeedLeftPct = doc["left_pct"] | motorSpeedLeftPct;    // keep last known value if missing
+  motorSpeedRightPct = doc["right_pct"] | motorSpeedRightPct;
   return doc["cmd"] | "none";
 }
 
@@ -189,8 +269,13 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIG_PIN_L, OUTPUT);
+  pinMode(ECHO_PIN_L, INPUT);
+  pinMode(TRIG_PIN_R, OUTPUT);
+  pinMode(ECHO_PIN_R, INPUT);
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA_PIN, OUTPUT); pinMode(ENB_PIN, OUTPUT);
   stopMotors();
 
   scanAndPrintNetworks();   // <-- diagnostic step, run before attempting connect
@@ -211,16 +296,26 @@ void setup() {
 
 // ── LOOP ─────────────────────────────────────────────────────────────────────
 void loop() {
-  float dist = readDistance();
-  Serial.printf("Distance: %.1f cm\n", dist);
-  postSensorData(dist);
+  // Fire sequentially with small gaps so echoes don't cross-talk between sensors.
+  float distFront = readDistanceOn(TRIG_PIN, ECHO_PIN);
+  delay(20);
+  float distLeft = readDistanceOn(TRIG_PIN_L, ECHO_PIN_L);
+  delay(20);
+  float distRight = readDistanceOn(TRIG_PIN_R, ECHO_PIN_R);
+  Serial.printf("Distance F=%.1f L=%.1f R=%.1f cm\n", distFront, distLeft, distRight);
+  postSensorData(distFront, distLeft, distRight);
 
   int duration = 500;
   String cmd = fetchCommand(duration);
 
   if (cmd == "forward") {
     Serial.println("CMD: forward");
-    driveForward(duration);
+    bool obstacleHit;
+    driveForward(duration, obstacleHit);
+    if (obstacleHit) reportObstacleStop();
+  } else if (cmd == "reverse") {
+    Serial.println("CMD: reverse");
+    driveReverse(duration);
   } else if (cmd == "left") {
     Serial.println("CMD: left 90°");
     turnLeft(TURN_90_MS);

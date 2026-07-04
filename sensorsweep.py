@@ -9,19 +9,39 @@ LOG_ODD_CLAMP = 4.0      # max |log-odds| to prevent infinite confidence
 
 # Physical calibration
 CELL_SIZE_CM   = 30.0    # one grid cell = this many cm (tune on real robot)
-OBSTACLE_RATIO = 0.8     # distance < CELL_SIZE * ratio → treat as obstacle
+
+# Must match robot_firmware.ino's readDistanceOn() timeout fallback — that's
+# the sentinel it returns when pulseIn() times out (nothing within ~4.3m
+# range), i.e. the only reliable signal that no real echo came back.
+NO_ECHO_CM = 400.0
 
 
-def update_from_real_sensor(robot_x, robot_y, direction, distance_cm, robot_map):
-    """
-    Update robot_map using a single front-facing HC-SR04 reading.
-    Marks the cell directly in front as occupied or free.
-    All cells between the robot and the detected obstacle are marked free.
-    """
+# Side sensors are mounted at a fixed ~30deg angle off the front sensor, too
+# narrow to treat as a separate cardinal ray on a 4-directional grid. Approximated
+# as a diagonal ray (front vector + perpendicular vector) — mostly-forward with a
+# sideways component, which is what a shallow mounting angle actually covers.
+def _diagonal_vector(direction, side):
     dx, dy = DIRECTION_VECTORS[direction]
+    perp_index = (direction + 1) % 4 if side == "left" else (direction - 1) % 4
+    pdx, pdy = DIRECTION_VECTORS[perp_index]
+    return dx + pdx, dy + pdy
+
+
+def update_from_real_sensor(robot_x, robot_y, direction, distance_cm, robot_map, side=None):
+    """
+    Update robot_map from one HC-SR04 reading (front, or angled left/right).
+    Marks the cell(s) along that ray as occupied or free.
+    `side=None` → straight-ahead front ray; `side="left"|"right"` → diagonal
+    ray approximating the angled side sensor.
+    """
+    if side is None:
+        dx, dy = DIRECTION_VECTORS[direction]
+    else:
+        dx, dy = _diagonal_vector(direction, side)
     rows, cols = robot_map.shape
     obstacle_cell = int(distance_cm / CELL_SIZE_CM)  # how many cells away
     obstacle_cell = max(1, obstacle_cell)             # at least 1 cell ahead
+    got_echo = distance_cm < NO_ECHO_CM               # False = sensor timed out, nothing in range
 
     # Mark cells along the ray
     for step in range(1, obstacle_cell + 1):
@@ -30,15 +50,16 @@ def update_from_real_sensor(robot_x, robot_y, direction, distance_cm, robot_map)
         if not (0 <= cx < rows and 0 <= cy < cols):
             break
 
-        if step < obstacle_cell or distance_cm >= CELL_SIZE_CM * OBSTACLE_RATIO * obstacle_cell:
-            # Cell is in front of the obstacle (or beyond sensor range) → free
-            robot_map[cx, cy] = np.clip(
-                robot_map[cx, cy] + LOG_ODD_MISS, -LOG_ODD_CLAMP, LOG_ODD_CLAMP
-            )
-        else:
-            # This is the obstacle cell
+        if step == obstacle_cell and got_echo:
+            # Ray's endpoint, and a real echo came back here — the obstacle
             robot_map[cx, cy] = np.clip(
                 robot_map[cx, cy] + LOG_ODD_HIT, -LOG_ODD_CLAMP, LOG_ODD_CLAMP
+            )
+        else:
+            # Cell is in front of the obstacle, or the sensor timed out
+            # (nothing detected within range) → free
+            robot_map[cx, cy] = np.clip(
+                robot_map[cx, cy] + LOG_ODD_MISS, -LOG_ODD_CLAMP, LOG_ODD_CLAMP
             )
 
 
