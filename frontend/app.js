@@ -376,41 +376,63 @@ async function calibrateTurn(dir) {
     }
 }
 
-// ─── Gyro Turn Calibration Logging ────────────────────────────────
-// Polls the last gyro-reported turn (from turnByAngle in firmware) so the
-// user knows what to go measure with a protractor, then logs their real
-// reading against it — builds the dataset calibrate_fit.py fits against.
+// ─── Calibration Logging (turns + forward/reverse distance) ──────
+// Polls the last reported test (turnByAngle's gyro estimate, or a completed
+// forward/reverse's commanded_cm + accel_distance_cm) so the user knows what
+// to go measure by hand, then logs their real reading(s) against it — builds
+// the dataset calibrate_fit.py fits against. Both the angle and distance
+// input are always shown — the user fills in whichever they measured for
+// that particular test, independent of test_type.
 async function pollCalibPending() {
     try {
         const res = await fetch(`${API}/calibrate/pending`);
         const data = await res.json();
-        document.getElementById("calib-commanded").textContent = data.pending ? data.commanded_deg.toFixed(1) : "-";
-        document.getElementById("calib-gyro").textContent = data.pending ? data.gyro_deg.toFixed(1) : "-";
         document.getElementById("calib-count").textContent = data.logged_count;
+        if (!data.pending) {
+            document.getElementById("calib-type").textContent = "-";
+            document.getElementById("calib-commanded").textContent = "-";
+            document.getElementById("calib-system").textContent = "-";
+            return;
+        }
+        document.getElementById("calib-type").textContent = data.test_type;
+        if (data.commanded_deg != null) {
+            document.getElementById("calib-commanded").textContent = `${data.commanded_deg.toFixed(1)}°`;
+            document.getElementById("calib-system").textContent = `${data.gyro_deg.toFixed(1)}° (gyro)`;
+        } else {
+            document.getElementById("calib-commanded").textContent = `${data.commanded_cm.toFixed(1)}cm`;
+            document.getElementById("calib-system").textContent = `${data.accel_distance_cm.toFixed(1)}cm (accel)`;
+        }
     } catch (err) {
         // silent — this is a secondary poll, main fetchAndDraw already surfaces connection errors
     }
 }
 
 async function submitCalibMeasured() {
-    const input = document.getElementById("calib-measured");
-    const measured_deg = parseFloat(input.value);
-    if (isNaN(measured_deg)) {
-        showMessage("Enter the measured angle");
+    const degInput = document.getElementById("calib-measured-deg");
+    const cmInput = document.getElementById("calib-measured-cm");
+    const notesInput = document.getElementById("calib-notes");
+
+    const measured_deg = degInput.value === "" ? null : parseFloat(degInput.value);
+    const measured_cm = cmInput.value === "" ? null : parseFloat(cmInput.value);
+    if (measured_deg == null && measured_cm == null) {
+        showMessage("Enter at least one measurement (angle or distance)");
         return;
     }
+
     try {
         const res = await fetch(`${API}/calibrate/measured`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ measured_deg })
+            body: JSON.stringify({ measured_deg, measured_cm, notes: notesInput.value || null })
         });
         const data = await res.json();
         if (data.status === "error") {
             showMessage(data.message);
         } else {
             document.getElementById("calib-count").textContent = data.logged_count;
-            input.value = "";
+            degInput.value = "";
+            cmInput.value = "";
+            notesInput.value = "";
             showMessage(`Logged (${data.logged_count} rows)`, "#4caf50");
             pollCalibPending();
         }

@@ -33,6 +33,10 @@ const int TURN_90_MS  = 81;
 // on-robot recalibration (distance-per-ms isn't perfectly linear in
 // practice — motor stall torque, battery sag, etc).
 const int FORWARD_MS  = 800;
+// Matches sensorsweep.py/app.js's cell size assumption — used to compute the
+// "commanded_cm" calibration field (expected distance implied by FORWARD_MS
+// timing) reported alongside each forward/reverse move.
+const float CELL_SIZE_CM = 30.48f;
 
 // Motion delay() is split into chunks this long, polling /stop_flag (and,
 // during driveForward, the front sensor) between each chunk — so a manual
@@ -166,10 +170,23 @@ void setMotorPins(int in1, int in2, int in3, int in4) {
 // self-aborts before contact — this is what closes the "blind for 800ms per
 // cell" gap: previously the sensor was only read once, before the drive
 // started, so anything that appeared mid-drive went undetected until impact.
-// obstacleHit (if non-null) reports whether the obstacle check tripped.
-bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) {
+// obstacleHit (if non-null) reports whether the obstacle check specifically
+// tripped (used for /obstacle_stop). completed (if non-null) reports whether
+// the motion ran to completion with no interruption at all (obstacle OR
+// manual stop) — used to decide whether a calibration sample is trustworthy.
+// accelDistanceCm (if non-null), when checkObstacle's caller also wants
+// distance tracking, accumulates a double-integrated forward-axis distance
+// estimate once per chunk — coarse (chunk-rate sampling, ~150ms) and prone to
+// drift like any double-integrated accelerometer estimate, but good enough
+// to log as a comparison point against a real tape-measure reading.
+bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr,
+                bool* completed = nullptr, float* accelDistanceCm = nullptr) {
   bool hit = false;
+  bool interrupted = false;
   int remaining = ms;
+  float velocity = 0;   // cm/s, integrated from forward-axis accel
+  float distance = 0;   // cm
+  unsigned long lastMs = millis();
 
   while (remaining > 0) {
     // Check BEFORE each chunk (including the last) rather than after — the
@@ -179,11 +196,26 @@ bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) 
     if (checkObstacle && readDistance() < SAFETY_STOP_CM) {
       Serial.println("[SAFETY] Obstacle within stop distance — aborting motion early");
       hit = true;
+      interrupted = true;
       break;
     }
     if (checkStopRequestedForward()) {
       Serial.println("[STOP] Manual stop — aborting motion early");
+      interrupted = true;
       break;
+    }
+
+    if (accelDistanceCm) {
+      float ax, ay, az, gz;
+      readImu(ax, ay, az, gz);
+      unsigned long now = millis();
+      float dt = (now - lastMs) / 1000.0f;
+      lastMs = now;
+      // Assumes MPU6050 X axis is the robot's forward/back axis — same
+      // mounting assumption as noted where FORWARD ACCEL is used elsewhere;
+      // swap to ay here if the board turns out mounted rotated 90 degrees.
+      velocity += ax * 100.0f * dt;   // m/s^2 -> cm/s^2, integrate to cm/s
+      distance += fabs(velocity) * dt;
     }
 
     int chunk = remaining < STOP_POLL_CHUNK_MS ? remaining : STOP_POLL_CHUNK_MS;
@@ -193,24 +225,26 @@ bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) 
 
   stopMotors();
   if (obstacleHit) *obstacleHit = hit;
-  return !hit;
+  if (completed) *completed = !interrupted;
+  if (accelDistanceCm) *accelDistanceCm = distance;
+  return !interrupted;
 }
 
-void driveForward(int ms, bool& obstacleHit) {
+void driveForward(int ms, bool& obstacleHit, bool& completed, float& accelDistanceCm) {
   // Motor polarity swapped: sensorsweep.py assumes the HC-SR04 faces the
   // direction of travel (it marks cells ahead of robot.direction as sensed).
   // The old pin pattern drove the robot away from the sensor end, so the
   // sensor was actually reading behind the robot. Swapping polarity here
   // makes "forward" drive toward the sensor end, matching that assumption.
   setMotorPins(LOW, HIGH, LOW, HIGH);
-  runMotion(ms, /*checkObstacle=*/true, &obstacleHit);
+  runMotion(ms, /*checkObstacle=*/true, &obstacleHit, &completed, &accelDistanceCm);
 }
 
-void driveReverse(int ms) {
+void driveReverse(int ms, bool& completed, float& accelDistanceCm) {
   // Opposite polarity of driveForward — drives away from the sensor end.
   // No rear sensor, so no live obstacle check here.
   setMotorPins(HIGH, LOW, HIGH, LOW);
-  runMotion(ms);
+  runMotion(ms, /*checkObstacle=*/false, nullptr, &completed, &accelDistanceCm);
 }
 
 // Turns run at a fixed, full-power PWM regardless of motorSpeedLeftPct/
@@ -372,16 +406,38 @@ void reportObstacleStop() {
   if (code != 200) Serial.printf("[SAFETY] /obstacle_stop report failed, HTTP %d\n", code);
 }
 
-// Reports what the gyro measured for a just-completed turnByAngle() call, so
-// it can be paired on the dashboard with a real protractor reading and logged
-// for calibrate_fit.py. Fire-and-forget — a dropped report just means one
-// fewer calibration sample, not a functional problem.
-void postCalibReport(float commandedDeg, float gyroDeg) {
-  String body = "{\"commanded_deg\":" + String(commandedDeg, 1) +
-                ",\"gyro_deg\":" + String(gyroDeg, 1) + "}";
+// Reports a just-completed turn/drive's commanded target vs. what the sensors
+// measured, so it can be paired on the dashboard with a real manual
+// measurement and logged for calibrate_fit.py. Fire-and-forget — a dropped
+// report just means one fewer calibration sample, not a functional problem.
+// Angle and distance fields are mutually exclusive per row (whichever isn't
+// applicable is sent as JSON null, not 0, so it isn't mistaken for a real
+// zero reading downstream).
+void postCalibReportInternal(const String& testType, bool hasDeg, float commandedDeg, float gyroDeg,
+                              bool hasCm, float commandedCm, float accelDistanceCm,
+                              int leftPct, int rightPct) {
+  String body = "{\"test_type\":\"" + testType + "\","
+                "\"commanded_deg\":" + (hasDeg ? String(commandedDeg, 1) : "null") + ","
+                "\"gyro_deg\":" + (hasDeg ? String(gyroDeg, 1) : "null") + ","
+                "\"commanded_cm\":" + (hasCm ? String(commandedCm, 1) : "null") + ","
+                "\"accel_distance_cm\":" + (hasCm ? String(accelDistanceCm, 1) : "null") + ","
+                "\"motor_left_pct\":" + String(leftPct) + ","
+                "\"motor_right_pct\":" + String(rightPct) + "}";
   String response;
   int code = httpRequest("/calibrate/report", true, body, 500, response);
   if (code != 200) Serial.printf("[CALIB] /calibrate/report failed, HTTP %d\n", code);
+}
+
+void postCalibReportTurn(const String& testType, float commandedDeg, float gyroDeg) {
+  // Turns always run at fixed full PWM regardless of the speed slider — log
+  // 100/100, not motorSpeedLeftPct/RightPct, since the slider isn't what
+  // actually drove the motors during a turn.
+  postCalibReportInternal(testType, true, commandedDeg, gyroDeg, false, 0, 0, 100, 100);
+}
+
+void postCalibReportDistance(const String& testType, float commandedCm, float accelDistanceCm) {
+  postCalibReportInternal(testType, false, 0, 0, true, commandedCm, accelDistanceCm,
+                           motorSpeedLeftPct, motorSpeedRightPct);
 }
 
 bool checkStopRequestedForward() {
@@ -471,24 +527,35 @@ void loop() {
 
   if (cmd == "forward") {
     Serial.println("CMD: forward");
-    bool obstacleHit;
-    driveForward(duration, obstacleHit);
+    bool obstacleHit, completed;
+    float accelDistanceCm;
+    driveForward(duration, obstacleHit, completed, accelDistanceCm);
     if (obstacleHit) reportObstacleStop();
+    if (completed) {
+      float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
+      postCalibReportDistance("forward", commandedCm, accelDistanceCm);
+    }
   } else if (cmd == "reverse") {
     Serial.println("CMD: reverse");
-    driveReverse(duration);
+    bool completed;
+    float accelDistanceCm;
+    driveReverse(duration, completed, accelDistanceCm);
+    if (completed) {
+      float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
+      postCalibReportDistance("reverse", commandedCm, accelDistanceCm);
+    }
   } else if (cmd == "left") {
     Serial.println("CMD: left 90°");
     float gyroDeg = turnByAngle(true, 90.0, TURN_90_MS);
-    postCalibReport(90.0, gyroDeg);
+    postCalibReportTurn("left", 90.0, gyroDeg);
   } else if (cmd == "right") {
     Serial.println("CMD: right 90°");
     float gyroDeg = turnByAngle(false, 90.0, TURN_90_MS);
-    postCalibReport(90.0, gyroDeg);
+    postCalibReportTurn("right", 90.0, gyroDeg);
   } else if (cmd == "uturn") {
     Serial.println("CMD: U-turn 180°");
     float gyroDeg = turnByAngle(false, 180.0, TURN_90_MS * 2);
-    postCalibReport(180.0, gyroDeg);
+    postCalibReportTurn("uturn", 180.0, gyroDeg);
   } else if (cmd == "calib_left") {
     // Turn calibration probe: spins for the server-supplied duration_ms
     // directly instead of the fixed TURN_90_MS, so real turn angle can be

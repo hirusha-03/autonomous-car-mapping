@@ -28,8 +28,9 @@
             background: var(--bg);
             color: var(--ink);
             font-family: var(--font-body);
-            min-height: 100vh;
-            padding: 28px;
+            height: 100vh;
+            overflow: hidden;
+            padding: 16px 20px;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -37,7 +38,7 @@
 
         header, .console {
             width: 100%;
-            max-width: 1180px;
+            max-width: 1440px;
         }
 
         @media (prefers-reduced-motion: reduce) {
@@ -48,9 +49,10 @@
             display: flex;
             align-items: baseline;
             gap: 14px;
-            margin-bottom: 20px;
+            margin-bottom: 12px;
             border-bottom: 1px solid var(--panel-line);
-            padding-bottom: 14px;
+            padding-bottom: 10px;
+            flex-shrink: 0;
         }
 
         h1 {
@@ -74,10 +76,11 @@
 
         .console {
             display: flex;
-            gap: 20px;
-            align-items: flex-start;
+            gap: 16px;
+            align-items: stretch;
             justify-content: center;
-            max-width: 1180px;
+            flex: 1;
+            min-height: 0;
         }
 
         /* ── Scope frame: the signature element ── */
@@ -86,11 +89,12 @@
             background: var(--panel);
             border: 1px solid var(--panel-line);
             border-radius: 6px;
-            padding: 34px 18px 18px 40px;
+            padding: 30px 16px 14px 36px;
             flex-shrink: 0;
             display: flex;
             flex-direction: column;
             align-items: center;
+            justify-content: center;
         }
 
         #scope-label {
@@ -196,10 +200,11 @@
         }
 
         #legend {
-            margin-top: 14px;
+            margin-top: 10px;
             display: flex;
             flex-wrap: wrap;
-            gap: 10px;
+            gap: 8px;
+            max-width: 460px;
         }
 
         .legend-item {
@@ -223,30 +228,32 @@
             flex-shrink: 0;
         }
 
-        /* ── Telemetry rail ── */
-        #rail {
+        /* ── Telemetry rails: left (control) + right (telemetry/calibration) ── */
+        .rail {
             display: flex;
             flex-direction: column;
-            gap: 12px;
-            width: 260px;
+            gap: 8px;
+            width: 230px;
             flex-shrink: 0;
+            overflow-y: auto;   /* safety net only — panels are sized to avoid needing this */
         }
 
         .panel {
             background: var(--panel);
             border: 1px solid var(--panel-line);
             border-radius: 6px;
-            padding: 12px 14px;
+            padding: 9px 11px;
+            flex-shrink: 0;
         }
 
         .panel-eyebrow {
             font-family: var(--font-display);
-            font-size: 0.68rem;
+            font-size: 0.66rem;
             font-weight: 600;
             letter-spacing: 2px;
             text-transform: uppercase;
             color: var(--ink-dim);
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             display: flex;
             align-items: center;
             gap: 8px;
@@ -481,9 +488,10 @@
             min-height: 18px;
         }
 
-        @media (max-width: 900px) {
-            .console { flex-direction: column; }
-            #rail { width: 100%; }
+        @media (max-width: 1100px), (max-height: 760px) {
+            body { height: auto; min-height: 100vh; overflow: auto; }
+            .console { flex-direction: column; align-items: center; }
+            .rail { width: 100%; max-width: 500px; overflow-y: visible; }
             #scope { padding-left: 40px; }
         }
     </style>
@@ -496,29 +504,7 @@
     </header>
 
     <div class="console">
-        <div id="scope">
-            <span id="scope-label">Scope</span>
-            <span id="live-indicator"><span id="live-dot"></span>LIVE</span>
-            <div id="ruler-top"></div>
-            <div id="ruler-left"></div>
-            <div id="canvas-container">
-                <canvas id="grid" width="500" height="500"></canvas>
-            </div>
-
-            <div id="legend">
-                <div class="legend-item"><div class="legend-box" style="background:#888"></div>Unknown</div>
-                <div class="legend-item"><div class="legend-box" style="background:#ffffff"></div>Free</div>
-                <div class="legend-item"><div class="legend-box" style="background:#111"></div>Obstacle</div>
-                <div class="legend-item"><div class="legend-box" style="background:#e53935"></div>Robot</div>
-                <div class="legend-item"><div class="legend-box" style="background:#fdd835"></div>Path</div>
-                <div class="legend-item"><div class="legend-box" style="background:#42a5f5"></div>Target</div>
-                <div class="legend-item"><div class="legend-box" style="background:#00e5ff"></div>Sonar F</div>
-                <div class="legend-item"><div class="legend-box" style="background:#76ff03"></div>Sonar L</div>
-                <div class="legend-item"><div class="legend-box" style="background:#ff4081"></div>Sonar R</div>
-            </div>
-        </div>
-
-        <div id="rail">
+        <div class="rail" id="left-rail">
             <div class="panel">
                 <div class="panel-eyebrow">Status</div>
                 <div id="status-row"><span id="status-dot"></span><span id="status-text">Idle</span></div>
@@ -529,35 +515,6 @@
                 <dl class="readout-grid">
                     <dt>X / Y</dt><dd><span id="pos-x">0</span> / <span id="pos-y">0</span></dd>
                     <dt>Goal</dt><dd id="goal-text">None</dd>
-                </dl>
-            </div>
-
-            <div class="panel">
-                <div class="panel-eyebrow">Sonar</div>
-                <div class="sonar-row">
-                    <span class="sonar-label">F</span>
-                    <div class="sonar-track"><div class="sonar-fill" id="sonar-f-bar" style="background:#00e5ff"></div></div>
-                    <span class="sonar-value"><span id="sonar-f">-</span>cm</span>
-                </div>
-                <div class="sonar-row">
-                    <span class="sonar-label">L</span>
-                    <div class="sonar-track"><div class="sonar-fill" id="sonar-l-bar" style="background:#76ff03"></div></div>
-                    <span class="sonar-value"><span id="sonar-l">-</span>cm</span>
-                </div>
-                <div class="sonar-row">
-                    <span class="sonar-label">R</span>
-                    <div class="sonar-track"><div class="sonar-fill" id="sonar-r-bar" style="background:#ff4081"></div></div>
-                    <span class="sonar-value"><span id="sonar-r">-</span>cm</span>
-                </div>
-            </div>
-
-            <div class="panel">
-                <div class="panel-eyebrow">IMU</div>
-                <dl class="readout-grid">
-                    <dt>Accel X</dt><dd><span id="imu-ax">-</span> m/s&sup2;</dd>
-                    <dt>Accel Y</dt><dd><span id="imu-ay">-</span> m/s&sup2;</dd>
-                    <dt>Accel Z</dt><dd><span id="imu-az">-</span> m/s&sup2;</dd>
-                    <dt>Gyro Z</dt><dd><span id="imu-gz">-</span> rad/s</dd>
                 </dl>
             </div>
 
@@ -596,8 +553,63 @@
                 </div>
             </div>
 
+            <div id="message"></div>
+        </div>
+
+        <div id="scope">
+            <span id="scope-label">Scope</span>
+            <span id="live-indicator"><span id="live-dot"></span>LIVE</span>
+            <div id="ruler-top"></div>
+            <div id="ruler-left"></div>
+            <div id="canvas-container">
+                <canvas id="grid" width="440" height="440"></canvas>
+            </div>
+
+            <div id="legend">
+                <div class="legend-item"><div class="legend-box" style="background:#888"></div>Unknown</div>
+                <div class="legend-item"><div class="legend-box" style="background:#ffffff"></div>Free</div>
+                <div class="legend-item"><div class="legend-box" style="background:#111"></div>Obstacle</div>
+                <div class="legend-item"><div class="legend-box" style="background:#e53935"></div>Robot</div>
+                <div class="legend-item"><div class="legend-box" style="background:#fdd835"></div>Path</div>
+                <div class="legend-item"><div class="legend-box" style="background:#42a5f5"></div>Target</div>
+                <div class="legend-item"><div class="legend-box" style="background:#00e5ff"></div>Sonar F</div>
+                <div class="legend-item"><div class="legend-box" style="background:#76ff03"></div>Sonar L</div>
+                <div class="legend-item"><div class="legend-box" style="background:#ff4081"></div>Sonar R</div>
+            </div>
+        </div>
+
+        <div class="rail" id="right-rail">
             <div class="panel">
-                <div class="panel-eyebrow">Turn Calibration</div>
+                <div class="panel-eyebrow">Sonar</div>
+                <div class="sonar-row">
+                    <span class="sonar-label">F</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-f-bar" style="background:#00e5ff"></div></div>
+                    <span class="sonar-value"><span id="sonar-f">-</span>cm</span>
+                </div>
+                <div class="sonar-row">
+                    <span class="sonar-label">L</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-l-bar" style="background:#76ff03"></div></div>
+                    <span class="sonar-value"><span id="sonar-l">-</span>cm</span>
+                </div>
+                <div class="sonar-row">
+                    <span class="sonar-label">R</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-r-bar" style="background:#ff4081"></div></div>
+                    <span class="sonar-value"><span id="sonar-r">-</span>cm</span>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">IMU</div>
+                <dl class="readout-grid">
+                    <dt>Accel X</dt><dd><span id="imu-ax">-</span> m/s&sup2;</dd>
+                    <dt>Accel Y</dt><dd><span id="imu-ay">-</span> m/s&sup2;</dd>
+                    <dt>Accel Z</dt><dd><span id="imu-az">-</span> m/s&sup2;</dd>
+                    <dt>Gyro Z</dt><dd><span id="imu-gz">-</span> rad/s</dd>
+                </dl>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Turn Probe</div>
                 <div class="speed-row">
                     <label for="calib-ms">MS</label>
                     <input type="number" id="calib-ms" value="163" min="1" step="1">
@@ -608,27 +620,34 @@
                         <button onclick="calibrateTurn('right')">Test &#8635;</button>
                     </div>
                 </div>
-                <p id="manual-hint">fires one raw turn at this duration &mdash; measure the real angle, then bisect toward 90&deg;</p>
+                <p id="manual-hint">raw duration_ms probe &mdash; bisect toward true 90&deg;</p>
             </div>
 
             <div class="panel">
-                <div class="panel-eyebrow">Gyro Calibration</div>
+                <div class="panel-eyebrow">Calibration</div>
                 <dl class="readout-grid">
-                    <dt>Commanded</dt><dd><span id="calib-commanded">-</span>&deg;</dd>
-                    <dt>Gyro said</dt><dd><span id="calib-gyro">-</span>&deg;</dd>
+                    <dt>Test</dt><dd id="calib-type">-</dd>
+                    <dt>Commanded</dt><dd><span id="calib-commanded">-</span></dd>
+                    <dt>System est.</dt><dd><span id="calib-system">-</span></dd>
                     <dt>Logged</dt><dd><span id="calib-count">0</span> rows</dd>
                 </dl>
                 <div class="speed-row">
-                    <label for="calib-measured">Real</label>
-                    <input type="number" id="calib-measured" step="0.1" placeholder="protractor deg">
+                    <label for="calib-measured-deg">Angle</label>
+                    <input type="number" id="calib-measured-deg" step="0.1" placeholder="deg">
+                </div>
+                <div class="speed-row">
+                    <label for="calib-measured-cm">Dist</label>
+                    <input type="number" id="calib-measured-cm" step="0.1" placeholder="cm">
+                </div>
+                <div class="speed-row">
+                    <label for="calib-notes">Notes</label>
+                    <input type="text" id="calib-notes" placeholder="optional">
                 </div>
                 <div id="nav-buttons">
                     <button onclick="submitCalibMeasured()">Log measurement</button>
                 </div>
-                <p id="manual-hint">after a left/right/uturn, measure the real angle and log it here &mdash; builds the dataset for calibrate_fit.py</p>
+                <p id="manual-hint">after any turn/drive, fill in whichever you measured (angle, distance, or both) and log it &mdash; builds the dataset for calibrate_fit.py</p>
             </div>
-
-            <div id="message"></div>
         </div>
     </div>
 

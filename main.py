@@ -12,7 +12,14 @@ import frontier as fr
 from navigation import start as start_navigation, TURN_90_MS, FORWARD_MS
 
 CALIB_LOG_PATH = os.path.join(os.path.dirname(__file__), "calibration_log.csv")
-CALIB_LOG_HEADER = ["timestamp", "commanded_deg", "gyro_deg", "measured_deg"]
+CALIB_LOG_HEADER = [
+    "timestamp", "test_type",
+    "commanded_deg", "gyro_deg",
+    "commanded_cm", "accel_distance_cm",
+    "measured_deg", "measured_cm",
+    "motor_left_pct", "motor_right_pct",
+    "notes",
+]
 
 app = FastAPI(
     title="Autonomous Car API",
@@ -59,8 +66,19 @@ class CalibrateTurn(BaseModel):
 
 
 class CalibReport(BaseModel):
-    commanded_deg: float
-    gyro_deg: float
+    test_type: str  # "left" | "right" | "uturn" | "forward" | "reverse"
+    commanded_deg: float | None = None
+    gyro_deg: float | None = None
+    commanded_cm: float | None = None
+    accel_distance_cm: float | None = None
+    motor_left_pct: int
+    motor_right_pct: int
+
+
+class CalibMeasured(BaseModel):
+    measured_deg: float | None = None
+    measured_cm: float | None = None
+    notes: str | None = None
 
 
 class CalibMeasured(BaseModel):
@@ -366,21 +384,27 @@ def calibrate_turn(turn: CalibrateTurn):
 
 @app.post("/calibrate/report")
 def calibrate_report(report: CalibReport):
-    """ESP32 posts here right after a gyro-corrected turn (see turnByAngle in
-    robot_firmware.ino) completes, reporting what the gyro measured. Overwrites
-    any previous pending report — only the most recent unlogged turn can be
-    measured/submitted at a time."""
+    """ESP32 posts here right after a completed turn (turnByAngle) or a fully-
+    completed forward/reverse drive, reporting what the sensors measured.
+    Overwrites any previous pending report — only the most recent unlogged
+    test can be measured/submitted at a time."""
     with robot.lock:
         robot.pending_calib_report = {
+            "test_type": report.test_type,
             "commanded_deg": report.commanded_deg,
             "gyro_deg": report.gyro_deg,
+            "commanded_cm": report.commanded_cm,
+            "accel_distance_cm": report.accel_distance_cm,
+            "motor_left_pct": report.motor_left_pct,
+            "motor_right_pct": report.motor_right_pct,
         }
     return {"status": "ok"}
 
 
 @app.get("/calibrate/pending")
 def calibrate_pending():
-    """Dashboard polls this to know what to go measure with a protractor."""
+    """Dashboard polls this to know what test is waiting to be measured by
+    hand (protractor for turns, tape measure for forward/reverse)."""
     with robot.lock:
         count = robot.calib_log_count
         if robot.pending_calib_report is None:
@@ -390,18 +414,31 @@ def calibrate_pending():
 
 @app.post("/calibrate/measured")
 def calibrate_measured(measured: CalibMeasured):
-    """User submits their real protractor reading for the currently-pending
-    gyro report, appending one row to calibration_log.csv for later fitting
-    (see calibrate_fit.py)."""
+    """User submits their real measurement(s) for the currently-pending
+    report, appending one row to calibration_log.csv for later fitting (see
+    calibrate_fit.py). measured_deg/measured_cm are independent — either, both,
+    or neither can be filled in by the user depending on what they measured
+    for this particular test, regardless of the pending report's test_type."""
+    if measured.measured_deg is None and measured.measured_cm is None:
+        return {"status": "error", "message": "Enter at least one measurement"}
+
     with robot.lock:
         if robot.pending_calib_report is None:
             return {"status": "error", "message": "No pending measurement to log"}
 
+        pending = robot.pending_calib_report
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "commanded_deg": robot.pending_calib_report["commanded_deg"],
-            "gyro_deg": robot.pending_calib_report["gyro_deg"],
+            "test_type": pending["test_type"],
+            "commanded_deg": pending["commanded_deg"],
+            "gyro_deg": pending["gyro_deg"],
+            "commanded_cm": pending["commanded_cm"],
+            "accel_distance_cm": pending["accel_distance_cm"],
             "measured_deg": measured.measured_deg,
+            "measured_cm": measured.measured_cm,
+            "motor_left_pct": pending["motor_left_pct"],
+            "motor_right_pct": pending["motor_right_pct"],
+            "notes": measured.notes,
         }
         write_header = not os.path.exists(CALIB_LOG_PATH)
         with open(CALIB_LOG_PATH, "a", newline="") as f:
