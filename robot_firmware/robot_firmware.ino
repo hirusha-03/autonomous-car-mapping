@@ -5,15 +5,16 @@
     HC-SR04 left  (~30deg off front): TRIG=GPIO4,  ECHO=GPIO5
     HC-SR04 right (~30deg off front): TRIG=GPIO15, ECHO=GPIO13
     L298N: IN1=GPIO25, IN2=GPIO26, IN3=GPIO27, IN4=GPIO14
-    NOTE: ENA/ENB are jumper-capped (always full speed, no PWM control).
-    KNOWN ISSUE (unresolved, flagged for later): robot drifts left on
-    driveForward — left wheel spins slower than right. Needs ENA/ENB wired
-    to ESP32 PWM pins + per-side speed trim to fix; deferred for now.
+    ENA=GPIO32, ENB=GPIO33 (PWM speed control, user-adjustable per side via
+    /speed — see motorSpeedLeftPct/motorSpeedRightPct below). Turns always
+    run at full PWM regardless of that setting; see turnLeft/turnRight.
+    MPU6050 (I2C): SDA=GPIO21, SCL=GPIO22, VCC=3.3V, GND=GND
 */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
 
 // ── CONFIG ───────────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "Hirusha’s iPhone";
@@ -21,9 +22,16 @@ const char* WIFI_PASSWORD = "HnH@141414";
 const char* SERVER_URL    = "http://172.20.10.2:8000";
 
 // Calibration — tune these on the real robot
-// TURN_90_MS was measured doing a full 360 instead of 90 at the old value
-// (650ms) — hardware-tested result: 650ms ≈ 360°, so 90° ≈ 650/4.
-const int TURN_90_MS  = 163;
+// Recalibrated via the /calibrate/turn bisection tool: 163ms was overshooting
+// to ~180°, real 90° measured at ~80.5ms. delay() only takes whole ms, so
+// this is rounded to the nearest integer (negligible vs. run-to-run drift).
+// Also used by turnByAngle() as the fallback timing when the MPU6050 isn't
+// available, and as the basis for its gyro-stall time cap.
+const int TURN_90_MS  = 81;
+// Cell size changed to 30.48cm (1ft) — half of the previous 60.96cm (2ft)
+// cell, so this is scaled back down proportionally; still pending a real
+// on-robot recalibration (distance-per-ms isn't perfectly linear in
+// practice — motor stall torque, battery sag, etc).
 const int FORWARD_MS  = 800;
 
 // Motion delay() is split into chunks this long, polling /stop_flag (and,
@@ -53,6 +61,11 @@ const float SAFETY_STOP_CM = 15.0;
 #define ENB_PIN 33   // PWM speed for motor B / right side (IN3/IN4) — jumper removed
 // If left/right feel swapped on the real chassis, swap ENA_PIN/ENB_PIN here
 // rather than relabeling anything server-side.
+#define MPU_SDA 21
+#define MPU_SCL 22
+#define MPU_ADDR 0x68
+
+bool mpuOk = false;
 
 // Requires ESP32 Arduino core >=3.0 (analogWrite is PWM-backed there; on
 // older cores use ledcAttach/ledcWrite instead).
@@ -80,6 +93,52 @@ float readDistanceOn(int trigPin, int echoPin) {
 
 float readDistance() {
   return readDistanceOn(TRIG_PIN, ECHO_PIN);
+}
+
+// ── IMU ──────────────────────────────────────────────────────────────────────
+// Raw register access rather than the Adafruit_MPU6050 library — that library
+// refuses to init on some clone GY-521 boards because it hard-checks the
+// WHO_AM_I register, even though the chip communicates fine over I2C. Talking
+// to the registers directly (same approach as the working sanity-check sketch)
+// sidesteps that check entirely.
+// gyroZ (rad/s) is the useful bit for this robot — yaw rate around the
+// vertical axis, i.e. how fast it's turning. Accel is reported too in case
+// it's useful later (tilt/collision detection) but nothing currently uses it.
+// Scale factors assume default full-scale ranges (no config write below):
+// accel +/-2g -> 16384 LSB/g, gyro +/-250 deg/s -> 131 LSB/(deg/s).
+// GYRO_GAIN/GYRO_BIAS_DPS correct systematic gyro error (constant offset while
+// still, and a scale-factor error vs. true rotation) — fit from real protractor
+// measurements via calibrate_fit.py against logged /calibrate/report data.
+// Defaults are no-ops until that fit is done once on the real robot.
+const float GYRO_GAIN = 1.0f;
+const float GYRO_BIAS_DPS = 0.0f;
+
+void readImu(float& accelX, float& accelY, float& accelZ, float& gyroZ) {
+  if (!mpuOk) { accelX = accelY = accelZ = gyroZ = 0; return; }
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);  // ACCEL_XOUT_H
+  if (Wire.endTransmission(false) != 0) {
+    accelX = accelY = accelZ = gyroZ = 0;
+    return;
+  }
+  Wire.requestFrom(MPU_ADDR, 14, true);
+  if (Wire.available() < 14) { accelX = accelY = accelZ = gyroZ = 0; return; }
+
+  int16_t rawAX = Wire.read() << 8 | Wire.read();
+  int16_t rawAY = Wire.read() << 8 | Wire.read();
+  int16_t rawAZ = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read();          // TEMP_OUT, unused
+  int16_t rawGX = Wire.read() << 8 | Wire.read();
+  int16_t rawGY = Wire.read() << 8 | Wire.read();
+  int16_t rawGZ = Wire.read() << 8 | Wire.read();
+  (void)rawGX; (void)rawGY;          // only yaw rate (Z) is currently used
+
+  accelX = rawAX / 16384.0f * 9.80665f;
+  accelY = rawAY / 16384.0f * 9.80665f;
+  accelZ = rawAZ / 16384.0f * 9.80665f;
+  float gzDps = (rawGZ / 131.0f - GYRO_BIAS_DPS) * GYRO_GAIN;
+  gyroZ = gzDps * (PI / 180.0f);
 }
 
 // ── MOTORS ───────────────────────────────────────────────────────────────────
@@ -113,11 +172,10 @@ bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) 
   int remaining = ms;
 
   while (remaining > 0) {
-    int chunk = remaining < STOP_POLL_CHUNK_MS ? remaining : STOP_POLL_CHUNK_MS;
-    delay(chunk);
-    remaining -= chunk;
-    if (remaining <= 0) break;
-
+    // Check BEFORE each chunk (including the last) rather than after — the
+    // old order skipped the check ahead of the final chunk entirely (it hit
+    // "remaining <= 0, break" first), so the robot drove its last ~150ms
+    // blind with no live check right as it got closest to an obstacle.
     if (checkObstacle && readDistance() < SAFETY_STOP_CM) {
       Serial.println("[SAFETY] Obstacle within stop distance — aborting motion early");
       hit = true;
@@ -127,6 +185,10 @@ bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr) 
       Serial.println("[STOP] Manual stop — aborting motion early");
       break;
     }
+
+    int chunk = remaining < STOP_POLL_CHUNK_MS ? remaining : STOP_POLL_CHUNK_MS;
+    delay(chunk);
+    remaining -= chunk;
   }
 
   stopMotors();
@@ -151,14 +213,81 @@ void driveReverse(int ms) {
   runMotion(ms);
 }
 
+// Turns run at a fixed, full-power PWM regardless of motorSpeedLeftPct/
+// motorSpeedRightPct — TURN_90_MS was calibrated at full power (see above),
+// so scaling turn speed with the user's forward/reverse speed slider would
+// throw off the ms-per-degree calibration (this was the cause of turns
+// falling well short of 90°).
 void turnLeft(int ms) {
-  setMotorPins(LOW, HIGH, HIGH, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA_PIN, 255);
+  analogWrite(ENB_PIN, 255);
   runMotion(ms);
 }
 
 void turnRight(int ms) {
-  setMotorPins(HIGH, LOW, LOW, HIGH);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA_PIN, 255);
+  analogWrite(ENB_PIN, 255);
   runMotion(ms);
+}
+
+// Gyro-corrected turn: spins at full PWM (same direction pins as turnLeft/
+// turnRight) until the integrated gyro_z angle reaches targetDeg, instead of
+// trusting a fixed ms duration — closes the drift gap noted above (motor
+// stall torque, battery sag make ms-per-degree inconsistent run to run).
+// Falls back to the old fixed-ms behavior if the MPU6050 isn't available, so
+// the robot still turns (just less precisely) without it.
+// Returns the gyro-integrated angle actually achieved (0 if mpuOk was false —
+// there's no gyro estimate to report in that case), so the caller can log it
+// against a real protractor measurement via /calibrate/report.
+float turnByAngle(bool isLeft, float targetDeg, int fallbackMs) {
+  if (isLeft) {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  }
+  analogWrite(ENA_PIN, 255);
+  analogWrite(ENB_PIN, 255);
+
+  if (!mpuOk) {
+    delay(fallbackMs);
+    stopMotors();
+    return 0;
+  }
+
+  const unsigned long MIN_MS = 20;     // ignore angle check briefly at start — avoids an
+                                        // early I2C noise spike causing an instant false stop
+  const unsigned long capMs = (unsigned long)fallbackMs * 3;  // ceiling if gyro stalls/reads zero
+
+  float accumulatedDeg = 0;
+  unsigned long startMs = millis();
+  unsigned long lastMs = startMs;
+
+  while (true) {
+    unsigned long now = millis();
+    float dt = (now - lastMs) / 1000.0f;
+    lastMs = now;
+
+    float ax, ay, az, gz;
+    readImu(ax, ay, az, gz);
+    accumulatedDeg += gz * (180.0f / PI) * dt;
+
+    unsigned long elapsed = now - startMs;
+    if (elapsed >= MIN_MS && fabs(accumulatedDeg) >= targetDeg) break;
+    if (elapsed >= capMs) {
+      Serial.println("[TURN] Gyro angle target not reached before cap — stopping anyway");
+      break;
+    }
+    delay(5);
+  }
+
+  stopMotors();
+  return accumulatedDeg;
 }
 
 // ── WIFI DIAGNOSTIC ──────────────────────────────────────────────────────────
@@ -222,20 +351,37 @@ int httpRequest(const String& path, bool isPost, const String& body, int timeout
   return code;
 }
 
-void postSensorData(float distFront, float distLeft, float distRight) {
+void postSensorData(float distFront, float distLeft, float distRight,
+                     float accelX, float accelY, float accelZ, float gyroZ) {
   String body = "{\"distance_cm\":" + String(distFront, 1) +
                 ",\"distance_left_cm\":" + String(distLeft, 1) +
-                ",\"distance_right_cm\":" + String(distRight, 1) + "}";
+                ",\"distance_right_cm\":" + String(distRight, 1) +
+                ",\"accel_x\":" + String(accelX, 3) +
+                ",\"accel_y\":" + String(accelY, 3) +
+                ",\"accel_z\":" + String(accelZ, 3) +
+                ",\"gyro_z\":" + String(gyroZ, 4) + "}";
   String response;
   int code = httpRequest("/sensor_data", true, body, 1000, response);
   if (code != 200) Serial.printf("[SENSOR] POST failed, HTTP %d\n", code);
-  else Serial.printf("[SENSOR] F=%.1f L=%.1f R=%.1f cm -> OK\n", distFront, distLeft, distRight);
+  else Serial.printf("[SENSOR] F=%.1f L=%.1f R=%.1f cm  gyroZ=%.3f -> OK\n", distFront, distLeft, distRight, gyroZ);
 }
 
 void reportObstacleStop() {
   String response;
   int code = httpRequest("/obstacle_stop", true, "{}", 500, response);
   if (code != 200) Serial.printf("[SAFETY] /obstacle_stop report failed, HTTP %d\n", code);
+}
+
+// Reports what the gyro measured for a just-completed turnByAngle() call, so
+// it can be paired on the dashboard with a real protractor reading and logged
+// for calibrate_fit.py. Fire-and-forget — a dropped report just means one
+// fewer calibration sample, not a functional problem.
+void postCalibReport(float commandedDeg, float gyroDeg) {
+  String body = "{\"commanded_deg\":" + String(commandedDeg, 1) +
+                ",\"gyro_deg\":" + String(gyroDeg, 1) + "}";
+  String response;
+  int code = httpRequest("/calibrate/report", true, body, 500, response);
+  if (code != 200) Serial.printf("[CALIB] /calibrate/report failed, HTTP %d\n", code);
 }
 
 bool checkStopRequestedForward() {
@@ -278,6 +424,17 @@ void setup() {
   pinMode(ENA_PIN, OUTPUT); pinMode(ENB_PIN, OUTPUT);
   stopMotors();
 
+  Wire.begin(MPU_SDA, MPU_SCL);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);  // PWR_MGMT_1
+  Wire.write(0);     // wake from sleep, default clock source
+  mpuOk = (Wire.endTransmission(true) == 0);
+  if (mpuOk) {
+    Serial.println("[MPU6050] Initialized OK");
+  } else {
+    Serial.println("[MPU6050] Not found — check wiring (SDA=21, SCL=22)");
+  }
+
   scanAndPrintNetworks();   // <-- diagnostic step, run before attempting connect
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -303,7 +460,11 @@ void loop() {
   delay(20);
   float distRight = readDistanceOn(TRIG_PIN_R, ECHO_PIN_R);
   Serial.printf("Distance F=%.1f L=%.1f R=%.1f cm\n", distFront, distLeft, distRight);
-  postSensorData(distFront, distLeft, distRight);
+
+  float accelX, accelY, accelZ, gyroZ;
+  readImu(accelX, accelY, accelZ, gyroZ);
+
+  postSensorData(distFront, distLeft, distRight, accelX, accelY, accelZ, gyroZ);
 
   int duration = 500;
   String cmd = fetchCommand(duration);
@@ -318,13 +479,25 @@ void loop() {
     driveReverse(duration);
   } else if (cmd == "left") {
     Serial.println("CMD: left 90°");
-    turnLeft(TURN_90_MS);
+    float gyroDeg = turnByAngle(true, 90.0, TURN_90_MS);
+    postCalibReport(90.0, gyroDeg);
   } else if (cmd == "right") {
     Serial.println("CMD: right 90°");
-    turnRight(TURN_90_MS);
+    float gyroDeg = turnByAngle(false, 90.0, TURN_90_MS);
+    postCalibReport(90.0, gyroDeg);
   } else if (cmd == "uturn") {
     Serial.println("CMD: U-turn 180°");
-    turnRight(TURN_90_MS * 2);
+    float gyroDeg = turnByAngle(false, 180.0, TURN_90_MS * 2);
+    postCalibReport(180.0, gyroDeg);
+  } else if (cmd == "calib_left") {
+    // Turn calibration probe: spins for the server-supplied duration_ms
+    // directly instead of the fixed TURN_90_MS, so real turn angle can be
+    // measured against arbitrary durations without reflashing per guess.
+    Serial.printf("CMD: calib left %dms\n", duration);
+    turnLeft(duration);
+  } else if (cmd == "calib_right") {
+    Serial.printf("CMD: calib right %dms\n", duration);
+    turnRight(duration);
   } else if (cmd == "stop") {
     stopMotors();
   }

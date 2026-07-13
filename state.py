@@ -11,7 +11,7 @@ DIRECTION_NAMES   = ["East", "North", "West", "South"]
 
 class RobotState:
     def __init__(self):
-        self.grid_size = (50, 50)
+        self.grid_size = (25, 25)
         self.x = self.grid_size[0] // 2
         self.y = self.grid_size[1] // 2
         self.direction = 0          # starts facing East
@@ -31,6 +31,21 @@ class RobotState:
         self.sensor_distance_left_cm = 400.0
         self.sensor_distance_right_cm = 400.0
         self.sensor_updated = False       # True once first real reading arrives
+
+        # MPU6050 IMU — accel in m/s^2, gyro_z (yaw rate) in rad/s. Defaults to
+        # 0 until the first real reading arrives (mirrors sensor_updated).
+        self.accel_x = 0.0
+        self.accel_y = 0.0
+        self.accel_z = 0.0
+        self.gyro_z = 0.0
+
+        # Gyro turn-calibration workflow: ESP32 reports what the gyro measured
+        # for a turn, user measures the real angle with a protractor and logs
+        # it via the dashboard — see /calibrate/report and /calibrate/measured
+        # in main.py. pending_calib_report holds the not-yet-measured report
+        # (None once logged or if nothing has been reported yet).
+        self.pending_calib_report = None
+        self.calib_log_count = 0
 
         # Motor command queue — navigation fills it, ESP32 drains it
         # Each entry: {"cmd": str, "duration_ms": int}
@@ -56,6 +71,23 @@ class RobotState:
         # very next command the robot executes.
         self.motor_speed_left_pct = 70
         self.motor_speed_right_pct = 70
+
+    def reset(self):
+        """Wipe the map and drive state back to a fresh start, keeping the
+        current sensor/PWM calibration (those reflect the physical robot,
+        not the map, so a map reset shouldn't discard them)."""
+        self.x = self.grid_size[0] // 2
+        self.y = self.grid_size[1] // 2
+        self.direction = 0
+        self.path = []
+        self.is_moving = False
+        self.goal = None
+        self.robot_map = np.full(self.grid_size, 0.0)
+        self.world_map = np.zeros(self.grid_size)
+        self.mode = "idle"
+        self.command_queue.clear()
+        self.pending_move = None
+        self.stop_requested = False
 
 
 robot = RobotState()

@@ -1,3 +1,7 @@
+import csv
+import os
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +10,9 @@ import sensorsweep as ss
 import astar as ast
 import frontier as fr
 from navigation import start as start_navigation, TURN_90_MS, FORWARD_MS
+
+CALIB_LOG_PATH = os.path.join(os.path.dirname(__file__), "calibration_log.csv")
+CALIB_LOG_HEADER = ["timestamp", "commanded_deg", "gyro_deg", "measured_deg"]
 
 app = FastAPI(
     title="Autonomous Car API",
@@ -31,6 +38,10 @@ class SensorData(BaseModel):
     distance_cm: float
     distance_left_cm: float | None = None
     distance_right_cm: float | None = None
+    accel_x: float | None = None
+    accel_y: float | None = None
+    accel_z: float | None = None
+    gyro_z: float | None = None
 
 
 class ManualMove(BaseModel):
@@ -40,6 +51,20 @@ class ManualMove(BaseModel):
 class SpeedSetting(BaseModel):
     left_pct: int
     right_pct: int
+
+
+class CalibrateTurn(BaseModel):
+    duration_ms: int
+    dir: str  # "left" | "right"
+
+
+class CalibReport(BaseModel):
+    commanded_deg: float
+    gyro_deg: float
+
+
+class CalibMeasured(BaseModel):
+    measured_deg: float
 
 
 # ── ESP32 endpoints ───────────────────────────────────────────────────────────
@@ -66,6 +91,14 @@ def receive_sensor_data(data: SensorData):
                 robot.x, robot.y, robot.direction,
                 data.distance_right_cm, robot.robot_map, side="right"
             )
+        if data.accel_x is not None:
+            robot.accel_x = data.accel_x
+        if data.accel_y is not None:
+            robot.accel_y = data.accel_y
+        if data.accel_z is not None:
+            robot.accel_z = data.accel_z
+        if data.gyro_z is not None:
+            robot.gyro_z = data.gyro_z
     return {"status": "ok"}
 
 
@@ -140,6 +173,21 @@ def startup():
     ss.sensor_sweep(robot.x, robot.y, robot.world_map, robot.robot_map, sensor_range=2)
     start_navigation()
 
+    if os.path.exists(CALIB_LOG_PATH):
+        with open(CALIB_LOG_PATH, newline="") as f:
+            robot.calib_log_count = sum(1 for _ in csv.reader(f)) - 1  # minus header row
+
+
+@app.post("/map/reset")
+def reset_map():
+    """User-triggered full reset: clears the map, drive state, and command
+    queue, and puts the robot back at grid center. Does not touch sensor
+    calibration (motor PWM %) since that's a robot property, not a map one."""
+    with robot.lock:
+        robot.reset()
+        ss.sensor_sweep(robot.x, robot.y, robot.world_map, robot.robot_map, sensor_range=2)
+    return {"status": "ok", "message": "Map and state reset"}
+
 
 @app.get("/map")
 def get_map():
@@ -158,6 +206,10 @@ def get_map():
             "sensor_distance_left_cm": robot.sensor_distance_left_cm,
             "sensor_distance_right_cm": robot.sensor_distance_right_cm,
             "sensor_connected": robot.sensor_updated,
+            "accel_x": robot.accel_x,
+            "accel_y": robot.accel_y,
+            "accel_z": robot.accel_z,
+            "gyro_z": robot.gyro_z,
             "pending_commands": len(robot.command_queue),
             "motor_speed_left_pct": robot.motor_speed_left_pct,
             "motor_speed_right_pct": robot.motor_speed_right_pct,
@@ -289,3 +341,76 @@ def manual_move(move: ManualMove):
         robot.pending_move = (nx, ny)
         robot.is_moving = True
         return {"status": "ok", "moving_to": (nx, ny)}
+
+
+@app.post("/calibrate/turn")
+def calibrate_turn(turn: CalibrateTurn):
+    """Debug/calibration probe: spins the robot for an arbitrary duration_ms
+    (bypassing TURN_90_MS) so the real ms-per-degree can be measured by hand
+    (protractor/tape) and bisected without reflashing firmware each guess.
+    Doesn't touch robot.direction/position — this is an off-grid test spin,
+    not a tracked navigation move."""
+    if turn.dir not in ("left", "right"):
+        return {"status": "error", "message": f"Unknown direction '{turn.dir}'"}
+    if turn.duration_ms <= 0:
+        return {"status": "error", "message": "duration_ms must be positive"}
+
+    with robot.lock:
+        if robot.is_moving:
+            return {"status": "error", "message": "Robot is already moving"}
+        robot.command_queue.append({"cmd": f"calib_{turn.dir}", "duration_ms": turn.duration_ms})
+        robot.is_moving = True
+        robot.mode = "manual"
+    return {"status": "ok", "duration_ms": turn.duration_ms, "dir": turn.dir}
+
+
+@app.post("/calibrate/report")
+def calibrate_report(report: CalibReport):
+    """ESP32 posts here right after a gyro-corrected turn (see turnByAngle in
+    robot_firmware.ino) completes, reporting what the gyro measured. Overwrites
+    any previous pending report — only the most recent unlogged turn can be
+    measured/submitted at a time."""
+    with robot.lock:
+        robot.pending_calib_report = {
+            "commanded_deg": report.commanded_deg,
+            "gyro_deg": report.gyro_deg,
+        }
+    return {"status": "ok"}
+
+
+@app.get("/calibrate/pending")
+def calibrate_pending():
+    """Dashboard polls this to know what to go measure with a protractor."""
+    with robot.lock:
+        count = robot.calib_log_count
+        if robot.pending_calib_report is None:
+            return {"pending": False, "logged_count": count}
+        return {"pending": True, "logged_count": count, **robot.pending_calib_report}
+
+
+@app.post("/calibrate/measured")
+def calibrate_measured(measured: CalibMeasured):
+    """User submits their real protractor reading for the currently-pending
+    gyro report, appending one row to calibration_log.csv for later fitting
+    (see calibrate_fit.py)."""
+    with robot.lock:
+        if robot.pending_calib_report is None:
+            return {"status": "error", "message": "No pending measurement to log"}
+
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "commanded_deg": robot.pending_calib_report["commanded_deg"],
+            "gyro_deg": robot.pending_calib_report["gyro_deg"],
+            "measured_deg": measured.measured_deg,
+        }
+        write_header = not os.path.exists(CALIB_LOG_PATH)
+        with open(CALIB_LOG_PATH, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CALIB_LOG_HEADER)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        robot.pending_calib_report = None
+        robot.calib_log_count += 1
+        count = robot.calib_log_count
+    return {"status": "ok", "logged_count": count}

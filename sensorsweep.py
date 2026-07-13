@@ -8,7 +8,7 @@ LOG_ODD_MISS = -2.2      # log-odds added when cell is free
 LOG_ODD_CLAMP = 4.0      # max |log-odds| to prevent infinite confidence
 
 # Physical calibration
-CELL_SIZE_CM   = 30.0    # one grid cell = this many cm (tune on real robot)
+CELL_SIZE_CM   = 30.48   # one grid cell = 1ft x 1ft real-world block
 
 # Must match robot_firmware.ino's readDistanceOn() timeout fallback — that's
 # the sentinel it returns when pulseIn() times out (nothing within ~4.3m

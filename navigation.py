@@ -9,10 +9,16 @@ MAX_REPLAN_ATTEMPTS = 3
 
 # Calibration — must match robot_firmware.ino constants
 TURN_90_MS  = 650   # ms to spin 90 degrees in place
-FORWARD_MS  = 800   # ms to drive one grid cell forward
+FORWARD_MS  = 800   # ms to drive one grid cell forward (30.48cm / 1ft cell, pending real-robot recalibration)
 
-# Wait for ESP32 to drain the command queue before updating robot position
-COMMAND_DRAIN_TIMEOUT = 5.0  # seconds
+# Wait for ESP32 to drain the command queue before updating robot position.
+# Generous on purpose: each queued command costs multiple full WiFi HTTP
+# round-trips (sensor POST, command GET, and a /stop_flag GET on every
+# ~150ms motion chunk — see robot_firmware.ino runMotion), so a normal
+# turn+forward pair can legitimately take several seconds on a real
+# connection. This is a safety net against genuine stalls, not a tight
+# timing budget.
+COMMAND_DRAIN_TIMEOUT = 12.0  # seconds
 
 
 def _required_direction(from_pos, to_pos):

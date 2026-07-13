@@ -5,6 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Autonomous Robot Navigator</title>
     <style>
+        :root {
+            --bg: #0a0e0d;
+            --panel: #10201a;
+            --panel-line: #1e3a2e;
+            --scope-green: #3ef2a0;
+            --scope-amber: #ffb454;
+            --ink: #d7f5e6;
+            --ink-dim: #5f8577;
+            --font-display: "Archivo Narrow", "Oswald", ui-sans-serif, system-ui, sans-serif;
+            --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+            --font-body: -apple-system, "Segoe UI", sans-serif;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -12,143 +25,420 @@
         }
 
         body {
-            background: #0f0f0f;
-            color: #e0e0e0;
-            font-family: 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--ink);
+            font-family: var(--font-body);
+            min-height: 100vh;
+            padding: 28px;
             display: flex;
             flex-direction: column;
             align-items: center;
-            min-height: 100vh;
-            padding: 30px;
+        }
+
+        header, .console {
+            width: 100%;
+            max-width: 1180px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+        }
+
+        header {
+            display: flex;
+            align-items: baseline;
+            gap: 14px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--panel-line);
+            padding-bottom: 14px;
         }
 
         h1 {
-            font-size: 1.6rem;
-            margin-bottom: 6px;
-            color: #ffffff;
-            letter-spacing: 1px;
+            font-family: var(--font-display);
+            font-size: 1.3rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2.5px;
+            color: var(--ink);
+        }
+
+        h1 .unit {
+            color: var(--scope-green);
         }
 
         #subtitle {
-            font-size: 0.85rem;
-            color: #888;
-            margin-bottom: 24px;
+            font-family: var(--font-mono);
+            font-size: 0.78rem;
+            color: var(--ink-dim);
+        }
+
+        .console {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+            justify-content: center;
+            max-width: 1180px;
+        }
+
+        /* ── Scope frame: the signature element ── */
+        #scope {
+            position: relative;
+            background: var(--panel);
+            border: 1px solid var(--panel-line);
+            border-radius: 6px;
+            padding: 34px 18px 18px 40px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #scope-label {
+            position: absolute;
+            top: 10px;
+            left: 40px;
+            font-family: var(--font-display);
+            font-size: 0.72rem;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            color: var(--ink-dim);
+        }
+
+        #live-indicator {
+            position: absolute;
+            top: 10px;
+            right: 18px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            letter-spacing: 1px;
+            color: var(--scope-green);
+        }
+
+        #live-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--scope-green);
+            animation: pulse 1.6s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 #3ef2a055; }
+            50% { opacity: 0.5; box-shadow: 0 0 0 4px #3ef2a000; }
+        }
+
+        #ruler-top {
+            position: absolute;
+            top: 34px;
+            left: 40px;
+            right: 18px;
+            height: 16px;
+            display: flex;
+            font-family: var(--font-mono);
+            font-size: 0.6rem;
+            color: var(--ink-dim);
+            pointer-events: none;
+        }
+
+        #ruler-left {
+            position: absolute;
+            top: 50px;
+            bottom: 18px;
+            left: 12px;
+            width: 24px;
+            display: flex;
+            flex-direction: column-reverse;
+            font-family: var(--font-mono);
+            font-size: 0.6rem;
+            color: var(--ink-dim);
+            pointer-events: none;
+        }
+
+        .tick {
+            position: absolute;
+            transform: translateX(-50%);
         }
 
         #canvas-container {
             position: relative;
+            border: 1px solid var(--panel-line);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        /* Corner brackets, drawn with border segments on pseudo-frames */
+        #canvas-container::before,
+        #canvas-container::after {
+            content: "";
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            pointer-events: none;
+            z-index: 2;
+        }
+        #canvas-container::before {
+            top: -1px; left: -1px;
+            border-top: 2px solid var(--scope-green);
+            border-left: 2px solid var(--scope-green);
+        }
+        #canvas-container::after {
+            bottom: -1px; right: -1px;
+            border-bottom: 2px solid var(--scope-green);
+            border-right: 2px solid var(--scope-green);
         }
 
         canvas {
-            border: 2px solid #333;
-            border-radius: 4px;
             cursor: crosshair;
             display: block;
         }
 
-        #info-bar {
-            margin-top: 16px;
-            display: flex;
-            gap: 24px;
-            font-size: 0.85rem;
-            color: #aaa;
-        }
-
-        #info-bar span {
-            background: #1a1a1a;
-            padding: 6px 14px;
-            border-radius: 4px;
-            border: 1px solid #2a2a2a;
-        }
-
-        #status-dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #4caf50;
-            margin-right: 6px;
-        }
-
-        #status-dot.moving {
-            background: #ff9800;
-        }
-
         #legend {
-            margin-top: 16px;
+            margin-top: 14px;
             display: flex;
-            gap: 16px;
-            font-size: 0.8rem;
-            color: #888;
+            flex-wrap: wrap;
+            gap: 10px;
         }
 
         .legend-item {
             display: flex;
             align-items: center;
             gap: 6px;
+            font-family: var(--font-mono);
+            font-size: 0.68rem;
+            color: var(--ink-dim);
+            background: var(--bg);
+            border: 1px solid var(--panel-line);
+            border-radius: 3px;
+            padding: 3px 8px;
         }
 
         .legend-box {
-            width: 14px;
-            height: 14px;
+            width: 10px;
+            height: 10px;
             border-radius: 2px;
-            border: 1px solid #444;
+            border: 1px solid #ffffff22;
+            flex-shrink: 0;
         }
 
-        #message {
-            margin-top: 12px;
-            font-size: 0.85rem;
-            color: #ff5252;
-            height: 20px;
-        }
-
-        #manual-controls {
-            margin-top: 16px;
+        /* ── Telemetry rail ── */
+        #rail {
             display: flex;
-            gap: 10px;
+            flex-direction: column;
+            gap: 12px;
+            width: 260px;
+            flex-shrink: 0;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--panel-line);
+            border-radius: 6px;
+            padding: 12px 14px;
+        }
+
+        .panel-eyebrow {
+            font-family: var(--font-display);
+            font-size: 0.68rem;
+            font-weight: 600;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: var(--ink-dim);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .panel-eyebrow::after {
+            content: "";
+            flex: 1;
+            height: 1px;
+            background: var(--panel-line);
+        }
+
+        #status-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+        }
+
+        #status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--scope-green);
+            box-shadow: 0 0 6px var(--scope-green);
+        }
+
+        #status-dot.moving {
+            background: var(--scope-amber);
+            box-shadow: 0 0 6px var(--scope-amber);
+            animation: pulse 1s ease-in-out infinite;
+        }
+
+        .readout-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 4px 10px;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        .readout-grid dt {
+            color: var(--ink-dim);
+            letter-spacing: 1px;
+        }
+
+        .readout-grid dd {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .sonar-row {
+            display: grid;
+            grid-template-columns: 16px 1fr 40px;
+            align-items: center;
+            gap: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            margin-bottom: 6px;
+        }
+
+        .sonar-row:last-child { margin-bottom: 0; }
+
+        .sonar-label { color: var(--ink-dim); }
+
+        .sonar-track {
+            height: 6px;
+            background: var(--bg);
+            border: 1px solid var(--panel-line);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .sonar-fill {
+            height: 100%;
+            width: 0%;
+            transition: width 0.2s ease;
+        }
+
+        .sonar-value {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            color: var(--ink);
+        }
+
+        button {
+            font-family: var(--font-body);
+            font-size: 0.8rem;
+            background: var(--bg);
+            color: var(--ink);
+            border: 1px solid var(--panel-line);
+            border-radius: 4px;
+            padding: 7px 10px;
+            cursor: pointer;
+            transition: border-color 0.15s, color 0.15s;
+        }
+
+        button:hover {
+            border-color: var(--scope-green);
+            color: var(--scope-green);
+        }
+
+        button:focus-visible {
+            outline: 2px solid var(--scope-green);
+            outline-offset: 1px;
+        }
+
+        #nav-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        #nav-buttons .row {
+            display: flex;
+            gap: 8px;
+        }
+        #nav-buttons .row button { flex: 1; }
+
+        /* Manual drive as a D-pad, matching the physical layout of the controls */
+        #dpad {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            grid-template-areas:
+                ".    up    ."
+                "left stop  right"
+                ".    down  .";
+            gap: 6px;
+        }
+
+        #dpad button { font-size: 1rem; padding: 10px 0; }
+        #dpad .up { grid-area: up; }
+        #dpad .down { grid-area: down; }
+        #dpad .left { grid-area: left; }
+        #dpad .right { grid-area: right; }
+        #dpad .stop-btn {
+            grid-area: stop;
+            color: var(--scope-amber);
+            border-color: var(--scope-amber);
         }
 
         #manual-hint {
-            margin-top: 6px;
-            font-size: 0.75rem;
-            color: #666;
-        }
-
-        #speed-control {
-            margin-top: 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            width: 320px;
-            background: #1a1a1a;
-            border: 1px solid #2a2a2a;
-            border-radius: 8px;
-            padding: 14px 18px;
+            margin-top: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            color: var(--ink-dim);
         }
 
         .speed-row {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
+            margin-bottom: 8px;
         }
+        .speed-row:last-child { margin-bottom: 0; }
 
         .speed-row label {
             display: flex;
             align-items: center;
-            gap: 8px;
-            font-size: 0.85rem;
-            color: #aaa;
-            width: 60px;
+            gap: 6px;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--ink-dim);
+            width: 50px;
             flex-shrink: 0;
         }
 
         .speed-badge {
             font-variant-numeric: tabular-nums;
-            font-size: 0.75rem;
-            color: #4caf50;
-            background: #4caf5018;
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            color: var(--scope-green);
+            background: #3ef2a018;
             padding: 1px 6px;
             border-radius: 10px;
+        }
+
+        .speed-row input[type="number"] {
+            flex: 1;
+            background: var(--bg);
+            color: var(--ink);
+            border: 1px solid var(--panel-line);
+            border-radius: 4px;
+            padding: 5px 8px;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        .speed-row input[type="number"]:focus-visible {
+            outline: 2px solid var(--scope-green);
+            outline-offset: 1px;
         }
 
         .speed-row input[type="range"] {
@@ -157,108 +447,190 @@
             appearance: none;
             height: 4px;
             border-radius: 2px;
-            background: #333;
+            background: var(--panel-line);
             outline: none;
         }
 
         .speed-row input[type="range"]::-webkit-slider-thumb {
             -webkit-appearance: none;
             appearance: none;
-            width: 16px;
-            height: 16px;
+            width: 14px;
+            height: 14px;
             border-radius: 50%;
-            background: #4caf50;
+            background: var(--scope-green);
             cursor: pointer;
-            border: 2px solid #0f0f0f;
-            box-shadow: 0 0 0 1px #4caf50;
+            border: 2px solid var(--bg);
+            box-shadow: 0 0 0 1px var(--scope-green);
         }
 
         .speed-row input[type="range"]::-moz-range-thumb {
-            width: 16px;
-            height: 16px;
+            width: 14px;
+            height: 14px;
             border-radius: 50%;
-            background: #4caf50;
+            background: var(--scope-green);
             cursor: pointer;
-            border: 2px solid #0f0f0f;
-            box-shadow: 0 0 0 1px #4caf50;
+            border: 2px solid var(--bg);
+            box-shadow: 0 0 0 1px var(--scope-green);
+        }
+
+        #message {
+            margin-top: 10px;
+            font-family: var(--font-mono);
+            font-size: 0.78rem;
+            color: #ff6b6b;
+            min-height: 18px;
+        }
+
+        @media (max-width: 900px) {
+            .console { flex-direction: column; }
+            #rail { width: 100%; }
+            #scope { padding-left: 40px; }
         }
     </style>
 </head>
 <body>
 
-    <h1>Autonomous Robot Navigator</h1>
-    <p id="subtitle">Click on the grid to set a destination</p>
+    <header>
+        <h1>Autonomous Car <span class="unit">// NAV-01</span></h1>
+        <p id="subtitle">click the scope to set a destination</p>
+    </header>
 
-    <div id="canvas-container">
-        <canvas id="grid" width="500" height="500"></canvas>
+    <div class="console">
+        <div id="scope">
+            <span id="scope-label">Scope</span>
+            <span id="live-indicator"><span id="live-dot"></span>LIVE</span>
+            <div id="ruler-top"></div>
+            <div id="ruler-left"></div>
+            <div id="canvas-container">
+                <canvas id="grid" width="500" height="500"></canvas>
+            </div>
+
+            <div id="legend">
+                <div class="legend-item"><div class="legend-box" style="background:#888"></div>Unknown</div>
+                <div class="legend-item"><div class="legend-box" style="background:#ffffff"></div>Free</div>
+                <div class="legend-item"><div class="legend-box" style="background:#111"></div>Obstacle</div>
+                <div class="legend-item"><div class="legend-box" style="background:#e53935"></div>Robot</div>
+                <div class="legend-item"><div class="legend-box" style="background:#fdd835"></div>Path</div>
+                <div class="legend-item"><div class="legend-box" style="background:#42a5f5"></div>Target</div>
+                <div class="legend-item"><div class="legend-box" style="background:#00e5ff"></div>Sonar F</div>
+                <div class="legend-item"><div class="legend-box" style="background:#76ff03"></div>Sonar L</div>
+                <div class="legend-item"><div class="legend-box" style="background:#ff4081"></div>Sonar R</div>
+            </div>
+        </div>
+
+        <div id="rail">
+            <div class="panel">
+                <div class="panel-eyebrow">Status</div>
+                <div id="status-row"><span id="status-dot"></span><span id="status-text">Idle</span></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Position</div>
+                <dl class="readout-grid">
+                    <dt>X / Y</dt><dd><span id="pos-x">0</span> / <span id="pos-y">0</span></dd>
+                    <dt>Goal</dt><dd id="goal-text">None</dd>
+                </dl>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Sonar</div>
+                <div class="sonar-row">
+                    <span class="sonar-label">F</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-f-bar" style="background:#00e5ff"></div></div>
+                    <span class="sonar-value"><span id="sonar-f">-</span>cm</span>
+                </div>
+                <div class="sonar-row">
+                    <span class="sonar-label">L</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-l-bar" style="background:#76ff03"></div></div>
+                    <span class="sonar-value"><span id="sonar-l">-</span>cm</span>
+                </div>
+                <div class="sonar-row">
+                    <span class="sonar-label">R</span>
+                    <div class="sonar-track"><div class="sonar-fill" id="sonar-r-bar" style="background:#ff4081"></div></div>
+                    <span class="sonar-value"><span id="sonar-r">-</span>cm</span>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">IMU</div>
+                <dl class="readout-grid">
+                    <dt>Accel X</dt><dd><span id="imu-ax">-</span> m/s&sup2;</dd>
+                    <dt>Accel Y</dt><dd><span id="imu-ay">-</span> m/s&sup2;</dd>
+                    <dt>Accel Z</dt><dd><span id="imu-az">-</span> m/s&sup2;</dd>
+                    <dt>Gyro Z</dt><dd><span id="imu-gz">-</span> rad/s</dd>
+                </dl>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Navigation</div>
+                <div id="nav-buttons">
+                    <div class="row">
+                        <button onclick="fetch(`${API}/explore/start`, {method:'POST'}).then(()=> showMessage('Exploring...', '#3ef2a0'))">Explore</button>
+                        <button onclick="fetch(`${API}/explore/stop`, {method:'POST'}).then(()=> showMessage('Stopped', '#5f8577'))">Stop</button>
+                    </div>
+                    <button onclick="if(confirm('Reset map and start over?')) fetch(`${API}/map/reset`, {method:'POST'}).then(()=> showMessage('Map reset', '#3ef2a0'))">Reset Map</button>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Manual Drive</div>
+                <div id="dpad">
+                    <button class="up" onclick="manualMove('forward')">&#8593;</button>
+                    <button class="left" onclick="manualMove('left')">&#8634;</button>
+                    <button class="stop-btn" onclick="manualMove('stop')">&#9632;</button>
+                    <button class="right" onclick="manualMove('right')">&#8635;</button>
+                    <button class="down" onclick="manualMove('reverse')">&#8595;</button>
+                </div>
+                <p id="manual-hint">arrow keys drive &middot; space stops</p>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Motor Trim</div>
+                <div class="speed-row">
+                    <label for="speed-left">L <span class="speed-badge" id="speed-left-value">70%</span></label>
+                    <input type="range" id="speed-left" min="10" max="100" value="70">
+                </div>
+                <div class="speed-row">
+                    <label for="speed-right">R <span class="speed-badge" id="speed-right-value">70%</span></label>
+                    <input type="range" id="speed-right" min="10" max="100" value="70">
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Turn Calibration</div>
+                <div class="speed-row">
+                    <label for="calib-ms">MS</label>
+                    <input type="number" id="calib-ms" value="163" min="1" step="1">
+                </div>
+                <div id="nav-buttons">
+                    <div class="row">
+                        <button onclick="calibrateTurn('left')">&#8634; Test</button>
+                        <button onclick="calibrateTurn('right')">Test &#8635;</button>
+                    </div>
+                </div>
+                <p id="manual-hint">fires one raw turn at this duration &mdash; measure the real angle, then bisect toward 90&deg;</p>
+            </div>
+
+            <div class="panel">
+                <div class="panel-eyebrow">Gyro Calibration</div>
+                <dl class="readout-grid">
+                    <dt>Commanded</dt><dd><span id="calib-commanded">-</span>&deg;</dd>
+                    <dt>Gyro said</dt><dd><span id="calib-gyro">-</span>&deg;</dd>
+                    <dt>Logged</dt><dd><span id="calib-count">0</span> rows</dd>
+                </dl>
+                <div class="speed-row">
+                    <label for="calib-measured">Real</label>
+                    <input type="number" id="calib-measured" step="0.1" placeholder="protractor deg">
+                </div>
+                <div id="nav-buttons">
+                    <button onclick="submitCalibMeasured()">Log measurement</button>
+                </div>
+                <p id="manual-hint">after a left/right/uturn, measure the real angle and log it here &mdash; builds the dataset for calibrate_fit.py</p>
+            </div>
+
+            <div id="message"></div>
+        </div>
     </div>
-
-    <div id="info-bar">
-        <span><span id="status-dot"></span><span id="status-text">Idle</span></span>
-        <span>Position: (<span id="pos-x">0</span>, <span id="pos-y">0</span>)</span>
-        <span>Goal: <span id="goal-text">None</span></span>
-        <span>Sonar F/L/R: <span id="sonar-f">-</span>/<span id="sonar-l">-</span>/<span id="sonar-r">-</span> cm</span>
-        <button onclick="fetch(`${API}/explore/start`, {method:'POST'})
-            .then(()=> showMessage('Exploring...', '#4caf50'))">
-            Auto-explore
-        </button>
-        <button onclick="fetch(`${API}/explore/stop`, {method:'POST'})
-            .then(()=> showMessage('Stopped', '#aaa'))">
-            Stop
-        </button>
-    </div>
-
-    <div id="manual-controls">
-        <button onclick="manualMove('left')">&#8634; Left</button>
-        <button onclick="manualMove('forward')">&#8593; Forward</button>
-        <button onclick="manualMove('right')">&#8635; Right</button>
-        <button onclick="manualMove('reverse')">&#8595; Reverse</button>
-        <button onclick="manualMove('stop')">Stop</button>
-    </div>
-    <p id="manual-hint">Manual control: use buttons or arrow keys (&larr; &uarr; &darr; &rarr;, space to stop)</p>
-
-    <div id="speed-control">
-        <div class="speed-row">
-            <label for="speed-left">Left <span class="speed-badge" id="speed-left-value">70%</span></label>
-            <input type="range" id="speed-left" min="10" max="100" value="70">
-        </div>
-        <div class="speed-row">
-            <label for="speed-right">Right <span class="speed-badge" id="speed-right-value">70%</span></label>
-            <input type="range" id="speed-right" min="10" max="100" value="70">
-        </div>
-    </div>
-
-    <div id="legend">
-        <div class="legend-item">
-            <div class="legend-box" style="background:#888"></div> Unknown
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#ffffff"></div> Free
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#111"></div> Obstacle
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#e53935"></div> Robot (white wedge = facing direction)
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#fdd835"></div> Path
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#42a5f5"></div> Target
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#00e5ff"></div> Sonar (front)
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#76ff03"></div> Sonar (left)
-        </div>
-        <div class="legend-item">
-            <div class="legend-box" style="background:#ff4081"></div> Sonar (right)
-        </div>
-    </div>
-
-    <div id="message"></div>
 
     <script src="app.js"></script>
 </body>

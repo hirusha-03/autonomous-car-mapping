@@ -2,7 +2,7 @@ const API = "http://127.0.0.1:8000";
 const canvas = document.getElementById("grid");
 const ctx = canvas.getContext("2d");
 
-const GRID_SIZE = 50;
+const GRID_SIZE = 25;
 const CELL_SIZE = canvas.width / GRID_SIZE;
 
 // Direction name (from backend) → unit vector in screen space (x right, y down)
@@ -35,6 +35,33 @@ function sensorRayVector(directionName, side) {
 let currentTarget = null;
 let lastState = null;
 let imageDataBuffer = null; // reused across frames to avoid reallocating
+
+// ─── Scope tick-rulers — static, built once from GRID_SIZE ───────────────
+function buildRulers() {
+    const top = document.getElementById("ruler-top");
+    const left = document.getElementById("ruler-left");
+    const step = 5;
+    for (let x = 0; x <= GRID_SIZE; x += step) {
+        const tick = document.createElement("span");
+        tick.className = "tick";
+        tick.style.left = `${(x / GRID_SIZE) * 100}%`;
+        tick.textContent = x;
+        top.appendChild(tick);
+    }
+    for (let y = 0; y <= GRID_SIZE; y += step) {
+        const tick = document.createElement("span");
+        tick.className = "tick";
+        tick.style.bottom = `${(y / GRID_SIZE) * 100}%`;
+        tick.textContent = y;
+        left.appendChild(tick);
+    }
+}
+buildRulers();
+
+// Sonar readings saturate the bar meter at this range — matches the
+// firmware's readDistanceOn() no-echo sentinel scale, just capped visually
+// well below 400cm so the bar is meaningful for in-room obstacle distances.
+const SONAR_BAR_MAX_CM = 150;
 
 // ─── Base occupancy layer via pixel buffer — cheap at any grid size ──────
 function drawBaseLayer(robot_map) {
@@ -204,6 +231,19 @@ function updateStatus(state) {
     document.getElementById("sonar-l").textContent = state.sensor_distance_left_cm.toFixed(0);
     document.getElementById("sonar-r").textContent = state.sensor_distance_right_cm.toFixed(0);
 
+    const setBar = (id, cm) => {
+        const pct = Math.max(0, Math.min(100, (cm / SONAR_BAR_MAX_CM) * 100));
+        document.getElementById(id).style.width = `${pct}%`;
+    };
+    setBar("sonar-f-bar", state.sensor_distance_cm);
+    setBar("sonar-l-bar", state.sensor_distance_left_cm);
+    setBar("sonar-r-bar", state.sensor_distance_right_cm);
+
+    document.getElementById("imu-ax").textContent = state.accel_x.toFixed(2);
+    document.getElementById("imu-ay").textContent = state.accel_y.toFixed(2);
+    document.getElementById("imu-az").textContent = state.accel_z.toFixed(2);
+    document.getElementById("imu-gz").textContent = state.gyro_z.toFixed(3);
+
     if (state.is_moving) {
         dot.className = "moving";
         statusText.textContent = "Navigating";
@@ -307,6 +347,80 @@ async function manualMove(cmd) {
         showMessage("Manual move request failed");
     }
 }
+
+// ─── Turn Calibration ──────────────────────────────────────────
+// Fires a single raw turn of an arbitrary duration_ms (bypassing the
+// firmware's fixed TURN_90_MS), so the real ms-per-degree can be found by
+// bisecting against a physical protractor/tape measurement instead of
+// reflashing firmware for every guess.
+async function calibrateTurn(dir) {
+    const ms = parseInt(document.getElementById("calib-ms").value, 10);
+    if (!ms || ms <= 0) {
+        showMessage("Enter a valid duration in ms");
+        return;
+    }
+    try {
+        const res = await fetch(`${API}/calibrate/turn`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ duration_ms: ms, dir })
+        });
+        const data = await res.json();
+        if (data.status === "error") {
+            showMessage(data.message);
+        } else {
+            showMessage(`Calibration turn: ${dir} @ ${ms}ms`, "#3ef2a0");
+        }
+    } catch (err) {
+        showMessage("Calibration request failed");
+    }
+}
+
+// ─── Gyro Turn Calibration Logging ────────────────────────────────
+// Polls the last gyro-reported turn (from turnByAngle in firmware) so the
+// user knows what to go measure with a protractor, then logs their real
+// reading against it — builds the dataset calibrate_fit.py fits against.
+async function pollCalibPending() {
+    try {
+        const res = await fetch(`${API}/calibrate/pending`);
+        const data = await res.json();
+        document.getElementById("calib-commanded").textContent = data.pending ? data.commanded_deg.toFixed(1) : "-";
+        document.getElementById("calib-gyro").textContent = data.pending ? data.gyro_deg.toFixed(1) : "-";
+        document.getElementById("calib-count").textContent = data.logged_count;
+    } catch (err) {
+        // silent — this is a secondary poll, main fetchAndDraw already surfaces connection errors
+    }
+}
+
+async function submitCalibMeasured() {
+    const input = document.getElementById("calib-measured");
+    const measured_deg = parseFloat(input.value);
+    if (isNaN(measured_deg)) {
+        showMessage("Enter the measured angle");
+        return;
+    }
+    try {
+        const res = await fetch(`${API}/calibrate/measured`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ measured_deg })
+        });
+        const data = await res.json();
+        if (data.status === "error") {
+            showMessage(data.message);
+        } else {
+            document.getElementById("calib-count").textContent = data.logged_count;
+            input.value = "";
+            showMessage(`Logged (${data.logged_count} rows)`, "#4caf50");
+            pollCalibPending();
+        }
+    } catch (err) {
+        showMessage("Failed to log measurement");
+    }
+}
+
+setInterval(pollCalibPending, 1000);
+pollCalibPending();
 
 // ─── Speed Control ───────────────────────────────────────────────
 // Independent left/right sliders rather than one speed + a fixed trim:
