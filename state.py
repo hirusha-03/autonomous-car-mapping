@@ -47,6 +47,16 @@ class RobotState:
         self.pending_calib_report = None
         self.calib_log_count = 0
 
+        # Multi-cell drift test session (Part 4): /calibrate/new_test snapshots
+        # test_origin (believed pose at session start) and bumps test_id so
+        # per-command calibration rows can be joined against drift_log.csv
+        # rows later. Decoupled from /map/reset on purpose — a map reset can
+        # happen for unrelated reasons (nav debugging) without starting a new
+        # labeled test session.
+        self.test_id = 0
+        self.test_origin = None  # (x, y, direction) or None before first new_test
+        self.commanded_sequence = []  # commands issued since the last new_test
+
         # Motor command queue — navigation fills it, ESP32 drains it
         # Each entry: {"cmd": str, "duration_ms": int}
         self.command_queue: deque = deque()

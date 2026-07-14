@@ -18,8 +18,19 @@ CALIB_LOG_HEADER = [
     "commanded_cm", "accel_distance_cm",
     "measured_deg", "measured_cm",
     "motor_left_pct", "motor_right_pct",
+    "notes", "test_id",
+]
+
+DRIFT_LOG_PATH = os.path.join(os.path.dirname(__file__), "drift_log.csv")
+DRIFT_LOG_HEADER = [
+    "timestamp", "test_id", "test_category", "commanded_sequence",
+    "believed_dx_cm", "believed_dy_cm", "believed_dheading_deg",
+    "measured_dx_cm", "measured_dy_cm", "measured_dheading_deg",
     "notes",
 ]
+
+# Matches robot_firmware.ino's CELL_SIZE_CM (30.48cm / 1ft grid cell).
+CELL_SIZE_CM = 30.48
 
 app = FastAPI(
     title="Autonomous Car API",
@@ -81,8 +92,12 @@ class CalibMeasured(BaseModel):
     notes: str | None = None
 
 
-class CalibMeasured(BaseModel):
-    measured_deg: float
+class DriftMeasured(BaseModel):
+    test_category: str  # "drift_straight" | "drift_turn" | "drift_combined"
+    measured_dx_cm: float | None = None
+    measured_dy_cm: float | None = None
+    measured_dheading_deg: float | None = None
+    notes: str | None = None
 
 
 # ── ESP32 endpoints ───────────────────────────────────────────────────────────
@@ -331,12 +346,14 @@ def manual_move(move: ManualMove):
         if move.cmd == "left":
             robot.direction = (robot.direction + 1) % 4
             robot.command_queue.append({"cmd": "left", "duration_ms": TURN_90_MS})
+            robot.commanded_sequence.append("left")
             robot.is_moving = True
             return {"status": "ok", "direction": DIRECTION_NAMES[robot.direction]}
 
         if move.cmd == "right":
             robot.direction = (robot.direction - 1) % 4
             robot.command_queue.append({"cmd": "right", "duration_ms": TURN_90_MS})
+            robot.commanded_sequence.append("right")
             robot.is_moving = True
             return {"status": "ok", "direction": DIRECTION_NAMES[robot.direction]}
 
@@ -354,8 +371,10 @@ def manual_move(move: ManualMove):
 
         if move.cmd == "forward":
             robot.command_queue.append({"cmd": "forward", "duration_ms": FORWARD_MS})
+            robot.commanded_sequence.append("forward")
         else:
             robot.command_queue.append({"cmd": "reverse", "duration_ms": FORWARD_MS})
+            robot.commanded_sequence.append("reverse")
         robot.pending_move = (nx, ny)
         robot.is_moving = True
         return {"status": "ok", "moving_to": (nx, ny)}
@@ -397,6 +416,7 @@ def calibrate_report(report: CalibReport):
             "accel_distance_cm": report.accel_distance_cm,
             "motor_left_pct": report.motor_left_pct,
             "motor_right_pct": report.motor_right_pct,
+            "test_id": robot.test_id,
         }
     return {"status": "ok"}
 
@@ -439,6 +459,7 @@ def calibrate_measured(measured: CalibMeasured):
             "motor_left_pct": pending["motor_left_pct"],
             "motor_right_pct": pending["motor_right_pct"],
             "notes": measured.notes,
+            "test_id": pending.get("test_id"),
         }
         write_header = not os.path.exists(CALIB_LOG_PATH)
         with open(CALIB_LOG_PATH, "a", newline="") as f:
@@ -451,3 +472,64 @@ def calibrate_measured(measured: CalibMeasured):
         robot.calib_log_count += 1
         count = robot.calib_log_count
     return {"status": "ok", "logged_count": count}
+
+
+@app.post("/calibrate/new_test")
+def calibrate_new_test():
+    """Starts a new labeled drift-test session: snapshots the robot's currently
+    believed pose as the session origin, bumps test_id, and clears the
+    commanded-sequence log. Deliberately separate from /map/reset — a map
+    reset can happen for unrelated reasons (nav debugging) without meaning
+    to start a new test session."""
+    with robot.lock:
+        robot.test_id += 1
+        robot.test_origin = (robot.x, robot.y, robot.direction)
+        robot.commanded_sequence = []
+        test_id = robot.test_id
+    return {"status": "ok", "test_id": test_id}
+
+
+@app.post("/calibrate/drift/measured")
+def calibrate_drift_measured(measured: DriftMeasured):
+    """User submits real (tape/protractor) measurements for the drift
+    accumulated since the last /calibrate/new_test call. Believed deltas are
+    computed from the robot's grid position/direction vs. the session origin;
+    measured deltas are whatever the user filled in (independent/optional,
+    same pattern as /calibrate/measured — reject only if all three are blank)."""
+    if (measured.measured_dx_cm is None and measured.measured_dy_cm is None
+            and measured.measured_dheading_deg is None):
+        return {"status": "error", "message": "Enter at least one measurement"}
+
+    with robot.lock:
+        if robot.test_origin is None:
+            return {"status": "error", "message": "No active test session — call /calibrate/new_test first"}
+
+        ox, oy, odir = robot.test_origin
+        believed_dx_cm = (robot.x - ox) * CELL_SIZE_CM
+        believed_dy_cm = (robot.y - oy) * CELL_SIZE_CM
+        # Grid direction only tracks heading mod 4 (90 deg steps) — the
+        # shortest signed difference is all that's recoverable, so a session
+        # with more than one full net rotation would under-report.
+        believed_dheading_deg = (((robot.direction - odir + 2) % 4) - 2) * 90
+
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "test_id": robot.test_id,
+            "test_category": measured.test_category,
+            "commanded_sequence": ",".join(robot.commanded_sequence),
+            "believed_dx_cm": believed_dx_cm,
+            "believed_dy_cm": believed_dy_cm,
+            "believed_dheading_deg": believed_dheading_deg,
+            "measured_dx_cm": measured.measured_dx_cm,
+            "measured_dy_cm": measured.measured_dy_cm,
+            "measured_dheading_deg": measured.measured_dheading_deg,
+            "notes": measured.notes,
+        }
+        write_header = not os.path.exists(DRIFT_LOG_PATH)
+        with open(DRIFT_LOG_PATH, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=DRIFT_LOG_HEADER)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    return {"status": "ok"}

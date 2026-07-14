@@ -6,13 +6,13 @@
     <title>Autonomous Robot Navigator</title>
     <style>
         :root {
-            --bg: #0a0e0d;
-            --panel: #10201a;
-            --panel-line: #1e3a2e;
-            --scope-green: #3ef2a0;
-            --scope-amber: #ffb454;
-            --ink: #d7f5e6;
-            --ink-dim: #5f8577;
+            --bg: #141a1d;
+            --panel: #1c2529;
+            --panel-line: #2e3a3e;
+            --scope-green: #6fc2a3;
+            --scope-amber: #e3a86b;
+            --ink: #dbe6e2;
+            --ink-dim: #7f9490;
             --font-display: "Archivo Narrow", "Oswald", ui-sans-serif, system-ui, sans-serif;
             --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
             --font-body: -apple-system, "Segoe UI", sans-serif;
@@ -38,7 +38,6 @@
 
         header, .console {
             width: 100%;
-            max-width: 1440px;
         }
 
         @media (prefers-reduced-motion: reduce) {
@@ -76,7 +75,7 @@
 
         .console {
             display: flex;
-            gap: 16px;
+            gap: 20px;
             align-items: stretch;
             justify-content: center;
             flex: 1;
@@ -228,14 +227,18 @@
             flex-shrink: 0;
         }
 
-        /* ── Telemetry rails: left (control) + right (telemetry/calibration) ── */
+        /* ── Telemetry rails: left (control) + right (telemetry/calibration) ──
+           2-column grid instead of a single stack: uses the freed-up side
+           space on wide screens and roughly halves rail height so the whole
+           console fits one viewport without scrolling. */
         .rail {
-            display: flex;
-            flex-direction: column;
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            grid-auto-rows: min-content;
             gap: 8px;
-            width: 230px;
-            flex-shrink: 0;
-            overflow-y: auto;   /* safety net only — panels are sized to avoid needing this */
+            flex: 1 1 0;
+            min-width: 320px;
+            max-width: 520px;
         }
 
         .panel {
@@ -243,7 +246,13 @@
             border: 1px solid var(--panel-line);
             border-radius: 6px;
             padding: 9px 11px;
-            flex-shrink: 0;
+            min-width: 0;   /* grid/flex children default to min-width:auto, which was
+                               letting number inputs/selects push panels past their
+                               column and overflow the page horizontally */
+        }
+
+        .panel.span-2 {
+            grid-column: span 2;
         }
 
         .panel-eyebrow {
@@ -422,6 +431,45 @@
             flex-shrink: 0;
         }
 
+        /* Compact 2-column field layout for panels with many inputs
+           (Calibration, Drift Test) — label stacked above input instead of
+           beside it, so more fields fit without growing panel height. */
+        .field-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 10px;
+            margin-bottom: 8px;
+        }
+
+        .field-grid .field-full { grid-column: span 2; }
+
+        .field-grid label {
+            display: block;
+            font-family: var(--font-mono);
+            font-size: 0.68rem;
+            color: var(--ink-dim);
+            margin-bottom: 3px;
+        }
+
+        .field-grid input,
+        .field-grid select {
+            width: 100%;
+            min-width: 0;
+            background: var(--bg);
+            color: var(--ink);
+            border: 1px solid var(--panel-line);
+            border-radius: 4px;
+            padding: 5px 8px;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        .field-grid input:focus-visible,
+        .field-grid select:focus-visible {
+            outline: 2px solid var(--scope-green);
+            outline-offset: 1px;
+        }
+
         .speed-badge {
             font-variant-numeric: tabular-nums;
             font-family: var(--font-mono);
@@ -432,8 +480,13 @@
             border-radius: 10px;
         }
 
-        .speed-row input[type="number"] {
+        .speed-row input[type="number"],
+        .speed-row input[type="text"],
+        .speed-row select {
             flex: 1;
+            min-width: 0;   /* prevents number/text inputs and selects from
+                               overflowing their panel — see .panel min-width note */
+            width: 100%;
             background: var(--bg);
             color: var(--ink);
             border: 1px solid var(--panel-line);
@@ -488,10 +541,10 @@
             min-height: 18px;
         }
 
-        @media (max-width: 1100px), (max-height: 760px) {
+        @media (max-width: 900px), (max-height: 700px) {
             body { height: auto; min-height: 100vh; overflow: auto; }
             .console { flex-direction: column; align-items: center; }
-            .rail { width: 100%; max-width: 500px; overflow-y: visible; }
+            .rail { grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; max-width: 560px; }
             #scope { padding-left: 40px; }
         }
     </style>
@@ -623,30 +676,71 @@
                 <p id="manual-hint">raw duration_ms probe &mdash; bisect toward true 90&deg;</p>
             </div>
 
-            <div class="panel">
+            <div class="panel span-2">
                 <div class="panel-eyebrow">Calibration</div>
-                <dl class="readout-grid">
+                <dl class="readout-grid" style="grid-template-columns: repeat(4, auto); margin-bottom: 8px;">
                     <dt>Test</dt><dd id="calib-type">-</dd>
                     <dt>Commanded</dt><dd><span id="calib-commanded">-</span></dd>
                     <dt>System est.</dt><dd><span id="calib-system">-</span></dd>
                     <dt>Logged</dt><dd><span id="calib-count">0</span> rows</dd>
                 </dl>
-                <div class="speed-row">
-                    <label for="calib-measured-deg">Angle</label>
-                    <input type="number" id="calib-measured-deg" step="0.1" placeholder="deg">
-                </div>
-                <div class="speed-row">
-                    <label for="calib-measured-cm">Dist</label>
-                    <input type="number" id="calib-measured-cm" step="0.1" placeholder="cm">
-                </div>
-                <div class="speed-row">
-                    <label for="calib-notes">Notes</label>
-                    <input type="text" id="calib-notes" placeholder="optional">
+                <div class="field-grid">
+                    <div>
+                        <label for="calib-measured-deg">Angle (deg)</label>
+                        <input type="number" id="calib-measured-deg" step="0.1" placeholder="deg">
+                    </div>
+                    <div>
+                        <label for="calib-measured-cm">Dist (cm)</label>
+                        <input type="number" id="calib-measured-cm" step="0.1" placeholder="cm">
+                    </div>
+                    <div class="field-full">
+                        <label for="calib-notes">Notes</label>
+                        <input type="text" id="calib-notes" placeholder="optional">
+                    </div>
                 </div>
                 <div id="nav-buttons">
                     <button onclick="submitCalibMeasured()">Log measurement</button>
                 </div>
                 <p id="manual-hint">after any turn/drive, fill in whichever you measured (angle, distance, or both) and log it &mdash; builds the dataset for calibrate_fit.py</p>
+            </div>
+
+            <div class="panel span-2">
+                <div class="panel-eyebrow">Drift Test</div>
+                <dl class="readout-grid" style="grid-template-columns: repeat(4, auto); margin-bottom: 8px;">
+                    <dt>Test ID</dt><dd><span id="drift-test-id">-</span></dd>
+                    <dt>Sequence</dt><dd><span id="drift-sequence">-</span></dd>
+                </dl>
+                <div class="field-grid">
+                    <div>
+                        <label for="drift-category">Type</label>
+                        <select id="drift-category">
+                            <option value="drift_straight">Straight</option>
+                            <option value="drift_turn">Turn</option>
+                            <option value="drift_combined">Combined</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="drift-measured-dx">dX (cm)</label>
+                        <input type="number" id="drift-measured-dx" step="0.1" placeholder="cm">
+                    </div>
+                    <div>
+                        <label for="drift-measured-dy">dY (cm)</label>
+                        <input type="number" id="drift-measured-dy" step="0.1" placeholder="cm">
+                    </div>
+                    <div>
+                        <label for="drift-measured-dheading">dHeading (deg)</label>
+                        <input type="number" id="drift-measured-dheading" step="0.1" placeholder="deg">
+                    </div>
+                    <div class="field-full">
+                        <label for="drift-notes">Notes</label>
+                        <input type="text" id="drift-notes" placeholder="optional">
+                    </div>
+                </div>
+                <div id="nav-buttons">
+                    <button onclick="startNewTest()">New test</button>
+                    <button onclick="submitDriftMeasured()">Log drift result</button>
+                </div>
+                <p id="manual-hint">hit New test before a multi-cell run, drive the sequence, measure the real end pose with tape/protractor from your marked start, then log it</p>
             </div>
         </div>
     </div>

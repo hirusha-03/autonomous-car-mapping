@@ -342,6 +342,9 @@ async function manualMove(cmd) {
         } else {
             currentTarget = null; // manual driving cancels any goto target marker
             showMessage(`Manual: ${cmd}`, "#4caf50");
+            if (["forward", "reverse", "left", "right"].includes(cmd)) {
+                noteDriftCommand(cmd);
+            }
         }
     } catch (err) {
         showMessage("Manual move request failed");
@@ -443,6 +446,74 @@ async function submitCalibMeasured() {
 
 setInterval(pollCalibPending, 1000);
 pollCalibPending();
+
+// ─── Drift Test (multi-cell session) ──────────────────────────
+// "New test" marks a session origin server-side (robot.test_origin/test_id)
+// so the server can compute believed_dx/dy/dheading later. This client-side
+// list is just for the on-screen sequence readout — the server tracks its
+// own commanded_sequence independently (populated by /manual/move) and is
+// the one actually written to drift_log.csv.
+let driftSequence = [];
+
+async function startNewTest() {
+    try {
+        const res = await fetch(`${API}/calibrate/new_test`, { method: "POST" });
+        const data = await res.json();
+        driftSequence = [];
+        document.getElementById("drift-test-id").textContent = data.test_id;
+        document.getElementById("drift-sequence").textContent = "-";
+        showMessage(`New test #${data.test_id} started`, "#3ef2a0");
+    } catch (err) {
+        showMessage("Failed to start new test");
+    }
+}
+
+// Called from the existing manual-move key/button handlers so the readout
+// reflects the sequence as it's driven, without polling a new endpoint.
+function noteDriftCommand(cmd) {
+    driftSequence.push(cmd);
+    document.getElementById("drift-sequence").textContent = driftSequence.join(",");
+}
+
+async function submitDriftMeasured() {
+    const category = document.getElementById("drift-category").value;
+    const dxInput = document.getElementById("drift-measured-dx");
+    const dyInput = document.getElementById("drift-measured-dy");
+    const dhInput = document.getElementById("drift-measured-dheading");
+    const notesInput = document.getElementById("drift-notes");
+
+    const measured_dx_cm = dxInput.value === "" ? null : parseFloat(dxInput.value);
+    const measured_dy_cm = dyInput.value === "" ? null : parseFloat(dyInput.value);
+    const measured_dheading_deg = dhInput.value === "" ? null : parseFloat(dhInput.value);
+    if (measured_dx_cm == null && measured_dy_cm == null && measured_dheading_deg == null) {
+        showMessage("Enter at least one measurement (dX, dY, or dHeading)");
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API}/calibrate/drift/measured`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                test_category: category,
+                measured_dx_cm, measured_dy_cm, measured_dheading_deg,
+                notes: notesInput.value || null
+            })
+        });
+        const data = await res.json();
+        if (data.status === "error") {
+            showMessage(data.message);
+        } else {
+            dxInput.value = "";
+            dyInput.value = "";
+            dhInput.value = "";
+            notesInput.value = "";
+            showMessage("Drift result logged", "#4caf50");
+        }
+    } catch (err) {
+        showMessage("Failed to log drift result");
+    }
+}
 
 // ─── Speed Control ───────────────────────────────────────────────
 // Independent left/right sliders rather than one speed + a fixed trim:
