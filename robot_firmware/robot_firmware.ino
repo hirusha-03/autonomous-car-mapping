@@ -9,16 +9,30 @@
     /speed — see motorSpeedLeftPct/motorSpeedRightPct below). Turns always
     run at full PWM regardless of that setting; see turnLeft/turnRight.
     MPU6050 (I2C): SDA=GPIO21, SCL=GPIO22, VCC=3.3V, GND=GND
+
+  Networking: robot traffic (sensor stream, motor commands, stop, obstacle
+  reports) rides one persistent WebSocket (/ws) instead of per-action HTTP
+  requests — a fresh HTTP connect/teardown on every loop iteration (plus a
+  /stop_flag poll every 150ms mid-motion) was the main source of perceived
+  lag. Calibration reporting (/calibrate/report) stays on plain HTTP since
+  it's post-motion, not latency-sensitive, and only runs during manual
+  calibration sessions, not normal driving.
+  Requires the "WebSockets" library by Markus Sattler (arduinoWebSockets).
 */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 
 // ── CONFIG ───────────────────────────────────────────────────────────────────
 const char* WIFI_SSID     = "Hirusha’s iPhone";
 const char* WIFI_PASSWORD = "HnH@141414";
+const char* SERVER_HOST   = "172.20.10.2";
+const uint16_t SERVER_PORT = 8000;
+const char* WS_PATH        = "/ws";
+// Still used for the calibration HTTP endpoints only (see bottom of file).
 const char* SERVER_URL    = "http://172.20.10.2:8000";
 
 // Calibration — tune these on the real robot
@@ -38,16 +52,19 @@ const int FORWARD_MS  = 800;
 // timing) reported alongside each forward/reverse move.
 const float CELL_SIZE_CM = 30.48f;
 
-// Motion delay() is split into chunks this long, polling /stop_flag (and,
-// during driveForward, the front sensor) between each chunk — so a manual
-// stop or an obstacle can abort a drive/turn already in progress instead of
-// waiting out the full duration_ms blind.
+// Motion delay() is split into chunks this long, checking for a pushed stop
+// frame (webSocket.loop() dispatches it via onWsEvent) between each chunk —
+// so a manual stop or an obstacle can abort a drive/turn already in progress
+// instead of waiting out the full duration_ms blind.
 const int STOP_POLL_CHUNK_MS = 150;
 
-// Forward drive self-aborts if the front sensor reads closer than this
-// mid-motion. Independent of the server's occupancy-grid obstacle ratio
-// (sensorsweep.py) — this is purely a physical collision-avoidance cutoff,
-// intentionally tighter than one grid cell (30cm) so it trips before contact.
+// Forward drive self-aborts if ANY of the three sensors reads closer than
+// this mid-motion. Checking all three (not just front) closes the gap where
+// an obstacle approached at the ~30deg angle the side sensors cover was
+// never checked during a drive, only reported after the fact. Independent
+// of the server's occupancy-grid obstacle ratio (sensorsweep.py) — this is
+// purely a physical collision-avoidance cutoff, intentionally tighter than
+// one grid cell (30cm) so it trips before contact.
 const float SAFETY_STOP_CM = 15.0;
 
 // ── PIN DEFINITIONS ──────────────────────────────────────────────────────────
@@ -71,12 +88,26 @@ const float SAFETY_STOP_CM = 15.0;
 
 bool mpuOk = false;
 
+WebSocketsClient webSocket;
+
+// Set by onWsEvent() when a {"type":"command"} frame arrives; consumed once
+// per loop() iteration. Only one command is ever in flight — the server only
+// pushes the next one after we send {"type":"ready"} for the previous one.
+volatile bool newCommandAvailable = false;
+String pendingCmd = "none";
+int pendingDurationMs = 500;
+
+// Edge-triggered: set by onWsEvent() on a {"type":"stop"} frame, consumed by
+// runMotion's chunk loop. No HTTP poll needed — the server pushes this the
+// instant a manual stop or nav abort happens.
+volatile bool stopRequested = false;
+
 // Requires ESP32 Arduino core >=3.0 (analogWrite is PWM-backed there; on
 // older cores use ledcAttach/ledcWrite instead).
 // Independent per-side rather than one speed + a fixed trim: measured drift
-// direction wasn't consistent across test runs (see ai_context/INDEX.md
-// Hardware Calibration Log), so a single fixed-direction correction would
-// assume a bias that doesn't always hold — these are user-adjustable instead.
+// direction wasn't consistent across test runs, so a single fixed-direction
+// correction would assume a bias that doesn't always hold — these are
+// user-adjustable instead.
 int motorSpeedLeftPct = 70;
 int motorSpeedRightPct = 70;
 
@@ -164,42 +195,62 @@ void setMotorPins(int in1, int in2, int in3, int in4) {
   applySpeed();
 }
 
-// Runs the motion for `ms` in STOP_POLL_CHUNK_MS steps, checking /stop_flag
-// between each so a manual stop can cut it short. If checkObstacle is true
-// (forward drive only), also checks the front sensor between chunks and
-// self-aborts before contact — this is what closes the "blind for 800ms per
-// cell" gap: previously the sensor was only read once, before the drive
-// started, so anything that appeared mid-drive went undetected until impact.
-// obstacleHit (if non-null) reports whether the obstacle check specifically
-// tripped (used for /obstacle_stop). completed (if non-null) reports whether
-// the motion ran to completion with no interruption at all (obstacle OR
-// manual stop) — used to decide whether a calibration sample is trustworthy.
-// accelDistanceCm (if non-null), when checkObstacle's caller also wants
-// distance tracking, accumulates a double-integrated forward-axis distance
-// estimate once per chunk — coarse (chunk-rate sampling, ~150ms) and prone to
-// drift like any double-integrated accelerometer estimate, but good enough
-// to log as a comparison point against a real tape-measure reading.
-bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr,
+// Runs the motion for `ms` in STOP_POLL_CHUNK_MS steps, checking for a pushed
+// stop frame between each (webSocket.loop() is what actually dispatches an
+// incoming frame to onWsEvent — must be called every chunk so a stop lands
+// promptly instead of waiting for the next full loop() iteration). If
+// checkObstacle is true (forward drive only), also checks all three sensors
+// between chunks and self-aborts before contact — this is what closes the
+// "blind for 800ms per cell" gap: previously the sensor was only read once,
+// before the drive started, so anything that appeared mid-drive went
+// undetected until impact. hitSide (if non-null) reports which sensor
+// tripped: 'F' (front), 'L', 'R', or 0 if none/interrupted by manual stop
+// instead — used for /obstacle_stop's side field. completed (if non-null)
+// reports whether the motion ran to completion with no interruption at all
+// (obstacle OR manual stop) — used to decide whether a calibration sample is
+// trustworthy. accelDistanceCm (if non-null), when checkObstacle's caller
+// also wants distance tracking, accumulates a double-integrated forward-axis
+// distance estimate once per chunk — coarse (chunk-rate sampling, ~150ms) and
+// prone to drift like any double-integrated accelerometer estimate, but good
+// enough to log as a comparison point against a real tape-measure reading.
+bool runMotion(int ms, bool checkObstacle = false, char* hitSide = nullptr,
                 bool* completed = nullptr, float* accelDistanceCm = nullptr) {
-  bool hit = false;
   bool interrupted = false;
+  char hit = 0;
   int remaining = ms;
   float velocity = 0;   // cm/s, integrated from forward-axis accel
   float distance = 0;   // cm
   unsigned long lastMs = millis();
 
   while (remaining > 0) {
+    webSocket.loop();  // dispatch any pushed stop frame to onWsEvent
+
     // Check BEFORE each chunk (including the last) rather than after — the
     // old order skipped the check ahead of the final chunk entirely (it hit
     // "remaining <= 0, break" first), so the robot drove its last ~150ms
     // blind with no live check right as it got closest to an obstacle.
-    if (checkObstacle && readDistance() < SAFETY_STOP_CM) {
-      Serial.println("[SAFETY] Obstacle within stop distance — aborting motion early");
-      hit = true;
-      interrupted = true;
-      break;
+    if (checkObstacle) {
+      // Staggered like loop()'s own sweep — HC-SR04s cross-talk if fired
+      // together.
+      if (readDistanceOn(TRIG_PIN, ECHO_PIN) < SAFETY_STOP_CM) {
+        hit = 'F';
+      } else {
+        delay(20);
+        if (readDistanceOn(TRIG_PIN_L, ECHO_PIN_L) < SAFETY_STOP_CM) {
+          hit = 'L';
+        } else {
+          delay(20);
+          if (readDistanceOn(TRIG_PIN_R, ECHO_PIN_R) < SAFETY_STOP_CM) hit = 'R';
+        }
+      }
+      if (hit) {
+        Serial.printf("[SAFETY] Obstacle within stop distance (%c) — aborting motion early\n", hit);
+        interrupted = true;
+        break;
+      }
     }
-    if (checkStopRequestedForward()) {
+    if (stopRequested) {
+      stopRequested = false;
       Serial.println("[STOP] Manual stop — aborting motion early");
       interrupted = true;
       break;
@@ -224,20 +275,20 @@ bool runMotion(int ms, bool checkObstacle = false, bool* obstacleHit = nullptr,
   }
 
   stopMotors();
-  if (obstacleHit) *obstacleHit = hit;
+  if (hitSide) *hitSide = hit;
   if (completed) *completed = !interrupted;
   if (accelDistanceCm) *accelDistanceCm = distance;
   return !interrupted;
 }
 
-void driveForward(int ms, bool& obstacleHit, bool& completed, float& accelDistanceCm) {
+void driveForward(int ms, char& hitSide, bool& completed, float& accelDistanceCm) {
   // Motor polarity swapped: sensorsweep.py assumes the HC-SR04 faces the
   // direction of travel (it marks cells ahead of robot.direction as sensed).
   // The old pin pattern drove the robot away from the sensor end, so the
   // sensor was actually reading behind the robot. Swapping polarity here
   // makes "forward" drive toward the sensor end, matching that assumption.
   setMotorPins(LOW, HIGH, LOW, HIGH);
-  runMotion(ms, /*checkObstacle=*/true, &obstacleHit, &completed, &accelDistanceCm);
+  runMotion(ms, /*checkObstacle=*/true, &hitSide, &completed, &accelDistanceCm);
 }
 
 void driveReverse(int ms, bool& completed, float& accelDistanceCm) {
@@ -360,11 +411,66 @@ void ensureWifi() {
   while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(100);
 }
 
-// Shared HTTP helper — all endpoint calls (sensor push, command poll, stop
-// poll, obstacle report) are a GET or POST to SERVER_URL+path with a JSON
-// body, differing only in timeout and what they do with the response.
-// Returns the HTTP status code, or -1 if WiFi wasn't connected; on success
-// the response body is written to `response`.
+// ── WEBSOCKET (robot traffic: sensor stream, commands, stop, obstacle) ──────
+void sendReady() {
+  webSocket.sendTXT("{\"type\":\"ready\"}");
+}
+
+void sendSensorData(float distFront, float distLeft, float distRight,
+                     float accelX, float accelY, float accelZ, float gyroZ) {
+  String body = "{\"type\":\"sensor\",\"distance_cm\":" + String(distFront, 1) +
+                ",\"distance_left_cm\":" + String(distLeft, 1) +
+                ",\"distance_right_cm\":" + String(distRight, 1) +
+                ",\"accel_x\":" + String(accelX, 3) +
+                ",\"accel_y\":" + String(accelY, 3) +
+                ",\"accel_z\":" + String(accelZ, 3) +
+                ",\"gyro_z\":" + String(gyroZ, 4) + "}";
+  webSocket.sendTXT(body);
+}
+
+void sendObstacleStop(char hitSide) {
+  String side = hitSide == 'L' ? "\"left\"" : hitSide == 'R' ? "\"right\"" : "null";
+  webSocket.sendTXT("{\"type\":\"obstacle_stop\",\"side\":" + side + "}");
+}
+
+// Dispatches an incoming JSON frame from the server. Called from webSocket.loop()
+// whenever a WStype_TEXT event arrives — may fire mid-motion (runMotion calls
+// webSocket.loop() every chunk), so this only ever sets flags/fields for the
+// main loop() / runMotion to act on, never blocks or drives motors directly.
+void onWsMessage(uint8_t* payload, size_t length) {
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, payload, length) != DeserializationError::Ok) return;
+
+  const char* type = doc["type"] | "";
+  if (strcmp(type, "command") == 0) {
+    pendingCmd = String((const char*)(doc["cmd"] | "none"));
+    pendingDurationMs = doc["duration_ms"] | 500;
+    motorSpeedLeftPct = doc["left_pct"] | motorSpeedLeftPct;    // keep last known value if missing
+    motorSpeedRightPct = doc["right_pct"] | motorSpeedRightPct;
+    newCommandAvailable = true;
+  } else if (strcmp(type, "stop") == 0) {
+    stopRequested = true;
+  }
+}
+
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("[WS] connected");
+      sendReady();
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] disconnected");
+      break;
+    case WStype_TEXT:
+      onWsMessage(payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+// ── HTTP (calibration endpoints only — not latency-sensitive) ──────────────
 int httpRequest(const String& path, bool isPost, const String& body, int timeoutMs, String& response) {
   ensureWifi();
   if (WiFi.status() != WL_CONNECTED) return -1;
@@ -383,27 +489,6 @@ int httpRequest(const String& path, bool isPost, const String& body, int timeout
   if (code == 200) response = http.getString();
   http.end();
   return code;
-}
-
-void postSensorData(float distFront, float distLeft, float distRight,
-                     float accelX, float accelY, float accelZ, float gyroZ) {
-  String body = "{\"distance_cm\":" + String(distFront, 1) +
-                ",\"distance_left_cm\":" + String(distLeft, 1) +
-                ",\"distance_right_cm\":" + String(distRight, 1) +
-                ",\"accel_x\":" + String(accelX, 3) +
-                ",\"accel_y\":" + String(accelY, 3) +
-                ",\"accel_z\":" + String(accelZ, 3) +
-                ",\"gyro_z\":" + String(gyroZ, 4) + "}";
-  String response;
-  int code = httpRequest("/sensor_data", true, body, 1000, response);
-  if (code != 200) Serial.printf("[SENSOR] POST failed, HTTP %d\n", code);
-  else Serial.printf("[SENSOR] F=%.1f L=%.1f R=%.1f cm  gyroZ=%.3f -> OK\n", distFront, distLeft, distRight, gyroZ);
-}
-
-void reportObstacleStop() {
-  String response;
-  int code = httpRequest("/obstacle_stop", true, "{}", 500, response);
-  if (code != 200) Serial.printf("[SAFETY] /obstacle_stop report failed, HTTP %d\n", code);
 }
 
 // Reports a just-completed turn/drive's commanded target vs. what the sensors
@@ -438,30 +523,6 @@ void postCalibReportTurn(const String& testType, float commandedDeg, float gyroD
 void postCalibReportDistance(const String& testType, float commandedCm, float accelDistanceCm) {
   postCalibReportInternal(testType, false, 0, 0, true, commandedCm, accelDistanceCm,
                            motorSpeedLeftPct, motorSpeedRightPct);
-}
-
-bool checkStopRequestedForward() {
-  String response;
-  int code = httpRequest("/stop_flag", false, "", 300, response);  // short timeout — runs between motion chunks
-  if (code != 200) return false;
-
-  StaticJsonDocument<64> doc;
-  if (deserializeJson(doc, response) != DeserializationError::Ok) return false;
-  return doc["stop"] | false;
-}
-
-String fetchCommand(int& out_duration) {
-  String response;
-  int code = httpRequest("/command", false, "", 1000, response);
-  if (code != 200) { Serial.printf("[CMD] GET failed, HTTP %d\n", code); return "none"; }
-
-  StaticJsonDocument<128> doc;
-  if (deserializeJson(doc, response) != DeserializationError::Ok) return "none";
-
-  out_duration = doc["duration_ms"] | 500;
-  motorSpeedLeftPct = doc["left_pct"] | motorSpeedLeftPct;    // keep last known value if missing
-  motorSpeedRightPct = doc["right_pct"] | motorSpeedRightPct;
-  return doc["cmd"] | "none";
 }
 
 // ── SETUP ────────────────────────────────────────────────────────────────────
@@ -505,69 +566,88 @@ void setup() {
     Serial.print("\nConnected! IP: ");
     Serial.println(WiFi.localIP());
   }
+
+  webSocket.begin(SERVER_HOST, SERVER_PORT, WS_PATH);
+  webSocket.onEvent(onWsEvent);
+  webSocket.setReconnectInterval(3000);
 }
 
 // ── LOOP ─────────────────────────────────────────────────────────────────────
+unsigned long lastSensorSendMs = 0;
+const unsigned long SENSOR_SEND_INTERVAL_MS = 100;
+
 void loop() {
-  // Fire sequentially with small gaps so echoes don't cross-talk between sensors.
-  float distFront = readDistanceOn(TRIG_PIN, ECHO_PIN);
-  delay(20);
-  float distLeft = readDistanceOn(TRIG_PIN_L, ECHO_PIN_L);
-  delay(20);
-  float distRight = readDistanceOn(TRIG_PIN_R, ECHO_PIN_R);
-  Serial.printf("Distance F=%.1f L=%.1f R=%.1f cm\n", distFront, distLeft, distRight);
+  ensureWifi();
+  webSocket.loop();
 
-  float accelX, accelY, accelZ, gyroZ;
-  readImu(accelX, accelY, accelZ, gyroZ);
+  unsigned long now = millis();
+  if (now - lastSensorSendMs >= SENSOR_SEND_INTERVAL_MS) {
+    lastSensorSendMs = now;
 
-  postSensorData(distFront, distLeft, distRight, accelX, accelY, accelZ, gyroZ);
+    // Fire sequentially with small gaps so echoes don't cross-talk between sensors.
+    float distFront = readDistanceOn(TRIG_PIN, ECHO_PIN);
+    delay(20);
+    float distLeft = readDistanceOn(TRIG_PIN_L, ECHO_PIN_L);
+    delay(20);
+    float distRight = readDistanceOn(TRIG_PIN_R, ECHO_PIN_R);
+    Serial.printf("Distance F=%.1f L=%.1f R=%.1f cm\n", distFront, distLeft, distRight);
 
-  int duration = 500;
-  String cmd = fetchCommand(duration);
+    float accelX, accelY, accelZ, gyroZ;
+    readImu(accelX, accelY, accelZ, gyroZ);
 
-  if (cmd == "forward") {
-    Serial.println("CMD: forward");
-    bool obstacleHit, completed;
-    float accelDistanceCm;
-    driveForward(duration, obstacleHit, completed, accelDistanceCm);
-    if (obstacleHit) reportObstacleStop();
-    if (completed) {
-      float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
-      postCalibReportDistance("forward", commandedCm, accelDistanceCm);
-    }
-  } else if (cmd == "reverse") {
-    Serial.println("CMD: reverse");
-    bool completed;
-    float accelDistanceCm;
-    driveReverse(duration, completed, accelDistanceCm);
-    if (completed) {
-      float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
-      postCalibReportDistance("reverse", commandedCm, accelDistanceCm);
-    }
-  } else if (cmd == "left") {
-    Serial.println("CMD: left 90°");
-    float gyroDeg = turnByAngle(true, 90.0, TURN_90_MS);
-    postCalibReportTurn("left", 90.0, gyroDeg);
-  } else if (cmd == "right") {
-    Serial.println("CMD: right 90°");
-    float gyroDeg = turnByAngle(false, 90.0, TURN_90_MS);
-    postCalibReportTurn("right", 90.0, gyroDeg);
-  } else if (cmd == "uturn") {
-    Serial.println("CMD: U-turn 180°");
-    float gyroDeg = turnByAngle(false, 180.0, TURN_90_MS * 2);
-    postCalibReportTurn("uturn", 180.0, gyroDeg);
-  } else if (cmd == "calib_left") {
-    // Turn calibration probe: spins for the server-supplied duration_ms
-    // directly instead of the fixed TURN_90_MS, so real turn angle can be
-    // measured against arbitrary durations without reflashing per guess.
-    Serial.printf("CMD: calib left %dms\n", duration);
-    turnLeft(duration);
-  } else if (cmd == "calib_right") {
-    Serial.printf("CMD: calib right %dms\n", duration);
-    turnRight(duration);
-  } else if (cmd == "stop") {
-    stopMotors();
+    sendSensorData(distFront, distLeft, distRight, accelX, accelY, accelZ, gyroZ);
   }
 
-  delay(100);
+  if (newCommandAvailable) {
+    newCommandAvailable = false;
+    String cmd = pendingCmd;
+    int duration = pendingDurationMs;
+
+    if (cmd == "forward") {
+      Serial.println("CMD: forward");
+      char hitSide = 0;
+      bool completed;
+      float accelDistanceCm;
+      driveForward(duration, hitSide, completed, accelDistanceCm);
+      if (hitSide) sendObstacleStop(hitSide);
+      if (completed) {
+        float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
+        postCalibReportDistance("forward", commandedCm, accelDistanceCm);
+      }
+    } else if (cmd == "reverse") {
+      Serial.println("CMD: reverse");
+      bool completed;
+      float accelDistanceCm;
+      driveReverse(duration, completed, accelDistanceCm);
+      if (completed) {
+        float commandedCm = (duration / (float)FORWARD_MS) * CELL_SIZE_CM;
+        postCalibReportDistance("reverse", commandedCm, accelDistanceCm);
+      }
+    } else if (cmd == "left") {
+      Serial.println("CMD: left 90°");
+      float gyroDeg = turnByAngle(true, 90.0, TURN_90_MS);
+      postCalibReportTurn("left", 90.0, gyroDeg);
+    } else if (cmd == "right") {
+      Serial.println("CMD: right 90°");
+      float gyroDeg = turnByAngle(false, 90.0, TURN_90_MS);
+      postCalibReportTurn("right", 90.0, gyroDeg);
+    } else if (cmd == "uturn") {
+      Serial.println("CMD: U-turn 180°");
+      float gyroDeg = turnByAngle(false, 180.0, TURN_90_MS * 2);
+      postCalibReportTurn("uturn", 180.0, gyroDeg);
+    } else if (cmd == "calib_left") {
+      // Turn calibration probe: spins for the server-supplied duration_ms
+      // directly instead of the fixed TURN_90_MS, so real turn angle can be
+      // measured against arbitrary durations without reflashing per guess.
+      Serial.printf("CMD: calib left %dms\n", duration);
+      turnLeft(duration);
+    } else if (cmd == "calib_right") {
+      Serial.printf("CMD: calib right %dms\n", duration);
+      turnRight(duration);
+    } else if (cmd == "stop") {
+      stopMotors();
+    }
+
+    sendReady();
+  }
 }

@@ -66,19 +66,25 @@ class RobotState:
         self.pending_move = None
 
         # Edge-triggered abort flag: set by /manual/move stop, consumed (and
-        # cleared) by the ESP32's mid-motion /stop_flag poll so a manual stop
-        # can interrupt a drive/turn already in progress instead of waiting
-        # for the current command's full duration_ms to elapse.
+        # cleared) by the WS writer loop the instant it ticks, pushing a
+        # {"type":"stop"} frame so a manual stop can interrupt a drive/turn
+        # already in progress instead of waiting for duration_ms to elapse.
         self.stop_requested = False
+
+        # True once the ESP32 has reported {"type":"ready"} over the /ws
+        # socket (on connect, and after finishing each command) and no
+        # command has been pushed to it since. The WS writer only pops
+        # command_queue when this is True, mirroring the old GET /command
+        # semantics (one in-flight command at a time) without polling.
+        self.esp32_ready = False
 
         # Independent motor PWM duty per side (10-100), applied by the ESP32
         # to ENA (left)/ENB (right). Separate rather than one speed + trim
         # because measured drift direction wasn't consistent across test
-        # runs (see ai_context/INDEX.md Hardware Calibration Log) — a fixed
-        # one-directional trim would assume a bias that doesn't always hold.
-        # Attached fresh to every /command response rather than threaded
-        # through each enqueue call site, so a change takes effect on the
-        # very next command the robot executes.
+        # runs — a fixed one-directional trim would assume a bias that
+        # doesn't always hold. Attached fresh to every command frame rather
+        # than threaded through each enqueue call site, so a change takes
+        # effect on the very next command the robot executes.
         self.motor_speed_left_pct = 70
         self.motor_speed_right_pct = 70
 
@@ -98,6 +104,7 @@ class RobotState:
         self.command_queue.clear()
         self.pending_move = None
         self.stop_requested = False
+        self.esp32_ready = False
 
 
 robot = RobotState()

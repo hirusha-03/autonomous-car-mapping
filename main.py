@@ -1,8 +1,9 @@
+import asyncio
 import csv
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from state import robot, DIRECTION_NAMES, DIRECTION_VECTORS
@@ -102,100 +103,148 @@ class DriftMeasured(BaseModel):
 
 # ── ESP32 endpoints ───────────────────────────────────────────────────────────
 
-@app.post("/sensor_data")
-def receive_sensor_data(data: SensorData):
-    """ESP32 pushes HC-SR04 readings here every ~100 ms (front required, left/right optional)."""
-    with robot.lock:
-        robot.sensor_distance_cm = data.distance_cm
-        robot.sensor_updated = True
+def _apply_sensor_reading(data: SensorData):
+    """Shared by the /ws sensor frame handler. Updates robot state + the
+    occupancy grid from one HC-SR04 reading (front required, left/right
+    optional). Caller must hold robot.lock."""
+    robot.sensor_distance_cm = data.distance_cm
+    robot.sensor_updated = True
+    ss.update_from_real_sensor(
+        robot.x, robot.y, robot.direction,
+        data.distance_cm, robot.robot_map
+    )
+    if data.distance_left_cm is not None:
+        robot.sensor_distance_left_cm = data.distance_left_cm
         ss.update_from_real_sensor(
             robot.x, robot.y, robot.direction,
-            data.distance_cm, robot.robot_map
+            data.distance_left_cm, robot.robot_map, side="left"
         )
-        if data.distance_left_cm is not None:
-            robot.sensor_distance_left_cm = data.distance_left_cm
-            ss.update_from_real_sensor(
-                robot.x, robot.y, robot.direction,
-                data.distance_left_cm, robot.robot_map, side="left"
-            )
-        if data.distance_right_cm is not None:
-            robot.sensor_distance_right_cm = data.distance_right_cm
-            ss.update_from_real_sensor(
-                robot.x, robot.y, robot.direction,
-                data.distance_right_cm, robot.robot_map, side="right"
-            )
-        if data.accel_x is not None:
-            robot.accel_x = data.accel_x
-        if data.accel_y is not None:
-            robot.accel_y = data.accel_y
-        if data.accel_z is not None:
-            robot.accel_z = data.accel_z
-        if data.gyro_z is not None:
-            robot.gyro_z = data.gyro_z
-    return {"status": "ok"}
+    if data.distance_right_cm is not None:
+        robot.sensor_distance_right_cm = data.distance_right_cm
+        ss.update_from_real_sensor(
+            robot.x, robot.y, robot.direction,
+            data.distance_right_cm, robot.robot_map, side="right"
+        )
+    if data.accel_x is not None:
+        robot.accel_x = data.accel_x
+    if data.accel_y is not None:
+        robot.accel_y = data.accel_y
+    if data.accel_z is not None:
+        robot.accel_z = data.accel_z
+    if data.gyro_z is not None:
+        robot.gyro_z = data.gyro_z
 
 
-@app.get("/command")
-def get_command():
-    """ESP32 polls here to receive the next motor command (FIFO)."""
-    with robot.lock:
-        cmd = robot.command_queue.popleft() if robot.command_queue else {"cmd": "none", "duration_ms": 0}
-        cmd["left_pct"] = robot.motor_speed_left_pct
-        cmd["right_pct"] = robot.motor_speed_right_pct
-    return cmd
+def _handle_obstacle_stop(side: str | None):
+    """Shared by the /ws obstacle_stop frame handler. `side` is "left"/"right"
+    (angled sensor tripped) or None (front sensor tripped). The queued forward
+    command did not complete, so the robot's position did not actually
+    advance — don't apply pending_move. Mark the obstacle cell so replanning
+    avoids it: the straight-ahead target cell for a front hit, or the
+    diagonal ray cell (matching sensorsweep.py's angled-sensor approximation)
+    for a side hit. Caller must hold robot.lock."""
+    target = robot.pending_move
+    robot.pending_move = None
+    robot.command_queue.clear()
+    robot.is_moving = False
+    robot.path = []
+    robot.goal = None
+    if robot.mode in ("goto", "manual"):
+        robot.mode = "idle"
+    # explore mode is left as-is: the nav loop's idle-tick branch will
+    # pick a new frontier target on its own now that the map reflects
+    # the obstacle, so no extra handling is needed here.
+
+    if side in ("left", "right"):
+        # Distance value here only needs to resolve to "obstacle 1 cell away"
+        # in update_from_real_sensor's math — matches robot_firmware.ino's
+        # SAFETY_STOP_CM (the threshold that actually tripped this stop).
+        ss.update_from_real_sensor(
+            robot.x, robot.y, robot.direction,
+            15.0, robot.robot_map, side=side
+        )
+    elif target is not None:
+        tx, ty = target
+        robot.robot_map[tx, ty] = max(
+            -ss.LOG_ODD_CLAMP, min(ss.LOG_ODD_CLAMP, robot.robot_map[tx, ty] + ss.LOG_ODD_HIT)
+        )
+
+
+@app.websocket("/ws")
+async def robot_socket(websocket: WebSocket):
+    """Single persistent connection replacing the old /sensor_data, /command,
+    /stop_flag, and /obstacle_stop HTTP polling — one socket instead of a
+    fresh HTTP connect/teardown per action, which is what made the robot feel
+    slow to react. The ESP32 sends {"type":"ready"} on connect and after each
+    finished command; a writer loop here pops robot.command_queue only while
+    esp32_ready is set, pushing the next command the instant it's available.
+    A manual stop is pushed immediately too, instead of waiting to be polled."""
+    await websocket.accept()
+
+    async def reader():
+        while True:
+            msg = await websocket.receive_json()
+            msg_type = msg.get("type")
+            with robot.lock:
+                if msg_type == "ready":
+                    robot.esp32_ready = True
+                elif msg_type == "sensor":
+                    _apply_sensor_reading(SensorData(**msg))
+                elif msg_type == "obstacle_stop":
+                    _handle_obstacle_stop(msg.get("side"))
+
+    async def writer():
+        while True:
+            with robot.lock:
+                if robot.stop_requested:
+                    robot.stop_requested = False
+                    send = {"type": "stop"}
+                elif robot.esp32_ready and robot.command_queue:
+                    cmd = robot.command_queue.popleft()
+                    cmd["type"] = "command"
+                    cmd["left_pct"] = robot.motor_speed_left_pct
+                    cmd["right_pct"] = robot.motor_speed_right_pct
+                    robot.esp32_ready = False
+                    send = cmd
+                else:
+                    send = None
+            if send is not None:
+                await websocket.send_json(send)
+            await asyncio.sleep(0.02)
+
+    reader_task = asyncio.create_task(reader())
+    writer_task = asyncio.create_task(writer())
+    try:
+        # Either task ending (disconnect surfaces via reader's receive_json)
+        # means the connection is done — cancel the other so it doesn't keep
+        # running against a dead socket.
+        done, pending = await asyncio.wait(
+            {reader_task, writer_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        with robot.lock:
+            robot.esp32_ready = False
 
 
 @app.post("/speed")
 def set_speed(setting: SpeedSetting):
     """Sets per-side motor PWM duty (%), applied by the ESP32 on its next
-    /command poll. Independent left/right (rather than one speed + a fixed
-    trim) because measured drift direction wasn't consistent across test
-    runs — see ai_context/INDEX.md. Clamped to 10-100: too low can't overcome
-    motor static friction and stalls without moving."""
+    command frame over /ws. Independent left/right (rather than one speed +
+    a fixed trim) because measured drift direction wasn't consistent across
+    test runs. Clamped to 10-100: too low can't overcome motor static
+    friction and stalls without moving."""
     left = max(10, min(100, setting.left_pct))
     right = max(10, min(100, setting.right_pct))
     with robot.lock:
         robot.motor_speed_left_pct = left
         robot.motor_speed_right_pct = right
     return {"status": "ok", "left_pct": left, "right_pct": right}
-
-
-@app.get("/stop_flag")
-def get_stop_flag():
-    """ESP32 polls this mid-motion (between chunked delay steps) to abort
-    a drive/turn early on manual stop. Consume-once: clears after being read."""
-    with robot.lock:
-        stop = robot.stop_requested
-        robot.stop_requested = False
-    return {"stop": stop}
-
-
-@app.post("/obstacle_stop")
-def obstacle_stop():
-    """ESP32 calls this when it self-aborted a forward drive because the front
-    sensor tripped the safety-stop distance mid-motion (see runMotion's live
-    obstacle check in robot_firmware.ino). The queued forward command did not
-    complete, so the robot's position did not actually advance — don't apply
-    pending_move. Mark the target cell as an obstacle so replanning avoids it."""
-    with robot.lock:
-        target = robot.pending_move
-        robot.pending_move = None
-        robot.command_queue.clear()
-        robot.is_moving = False
-        robot.path = []
-        robot.goal = None
-        if robot.mode in ("goto", "manual"):
-            robot.mode = "idle"
-        # explore mode is left as-is: the nav loop's idle-tick branch will
-        # pick a new frontier target on its own now that the map reflects
-        # the obstacle, so no extra handling is needed here.
-
-        if target is not None:
-            tx, ty = target
-            robot.robot_map[tx, ty] = max(
-                -ss.LOG_ODD_CLAMP, min(ss.LOG_ODD_CLAMP, robot.robot_map[tx, ty] + ss.LOG_ODD_HIT)
-            )
-    return {"status": "ok"}
 
 
 # ── Dashboard / frontend endpoints ───────────────────────────────────────────
